@@ -1,0 +1,4 @@
+PyQt5>=5.15
+scapy
+# T-Rex Python bindings if available in your environment
+# example package name: trex-stl or trex
