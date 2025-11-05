@@ -1,379 +1,345 @@
 # modules/traffic_tab.py
-# 流量配置标签页（增强版：完整流构建 UI，与 TrexController.create_flow_template/_create_vm_for_random 对接）
+# 重构：通过预定义的 L2/L3/L4/TUNNEL 层预设构建报文，并且为每个占位字段支持模式：
+# 固定值(fixed)、增量(inc)、递减(dec) 和 随机(random)。
 #
-# 新增：
-# - 在界面中显示每个端口的流列表（flow_table）
-# - 为每行添加“编辑 / 启动 / 停止 / 删除”操作列
-# - 编辑功能会把选中流的参数载入表单进行修改并保存（下发或本地保存）
-# - 启动/停止/删除会调用 controller 提供的相应接口并刷新显示
+# 主要点：
+# - 在 composition 中为每层保存 template（含占位符）和 fields 配置。
+# - UI 在选择 composition 条目时显示该层的 fields 编辑表格（可编辑模式与参数）。
+# - 构建报文时根据各字段的 mode 与序号（flow_index）计算具体值并替换到 template 中得到具体表达式。
+# - random 对 IP/数字分别做合理随机：IP 使用 ipaddress；数值使用 randint。
+# - 新增 create_streams_from_composition 方法，基于 params['composition'] 生成 STLVM 指令、STLPktBuilder 与 STLStream，并扩展对 IPv6 的支持。
+import random
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
-    QGroupBox, QSpinBox, QDoubleSpinBox, QLineEdit, QTextEdit, QTableWidget,
-    QTableWidgetItem, QHeaderView, QCheckBox, QMessageBox, QWidgetItem, QSizePolicy
+    QGroupBox, QSpinBox, QLineEdit, QTextEdit, QListWidget,
+    QListWidgetItem, QTableWidget, QTableWidgetItem, QMessageBox
 )
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QColor
 import traceback
 import ipaddress
 import time
 from functools import partial
 
-# T-Rex STL imports are optional — only used when connected to real T-Rex
+# Optional T-Rex STL imports
 try:
-    from trex.stl.api import STLStream, STLPktBuilder, STLTXCont, STLFlowStats
+    from trex.stl.api import STLStream, STLPktBuilder, STLTXCont, STLFlowStats, STLVM
     TREX_STL_AVAILABLE = True
 except Exception:
-    STLStream = STLPktBuilder = STLTXCont = STLFlowStats = None
+    STLStream = STLPktBuilder = STLTXCont = STLFlowStats = STLVM = None
     TREX_STL_AVAILABLE = False
+
+# Optional scapy import for building/previewing composed packets
+try:
+    import scapy.all as scapy
+    SCAPY_AVAILABLE = True
+except Exception:
+    scapy = None
+    SCAPY_AVAILABLE = False
+
+# Layer presets (template contains placeholders like {src_ip}, {dst_port} etc.)
+LAYER_PRESETS = {
+    'L2': [
+        {'id': 'eth', 'name': 'Ethernet', 'template': "Ether(dst='{dst_mac}', src='{src_mac}')"},
+        {'id': 'vlan', 'name': '802.1Q VLAN', 'template': "Dot1Q(vlan={vlan_id}, prio={vlan_prio})"},
+    ],
+    'L3': [
+        {'id': 'ipv4', 'name': 'IPv4', 'template': "IP(src='{src_ip}', dst='{dst_ip}')"},
+        {'id': 'ipv6', 'name': 'IPv6', 'template': "IPv6(src='{src_ip}', dst='{dst_ip}')"},
+    ],
+    'L4': [
+        {'id': 'udp', 'name': 'UDP', 'template': "UDP(sport={src_port}, dport={dst_port})"},
+        {'id': 'tcp', 'name': 'TCP', 'template': "TCP(sport={src_port}, dport={dst_port})"},
+    ],
+    'TUNNEL': [
+        {'id': 'vxlan', 'name': 'VXLAN (placeholder)', 'template': "Raw(b'VXLAN')"},
+        {'id': 'gre', 'name': 'GRE (placeholder)', 'template': "GRE()"},
+    ]
+}
+
+FIELD_MODES = ['fixed', 'inc', 'dec', 'random']
+
+def extract_placeholders(template: str):
+    import re
+    return re.findall(r"\\{(\\w+)\\}", template)
+
 
 class TrafficTab(QWidget):
     """
-    TrafficTab provides a rich UI to construct flows, including randomization options,
-    and will use TrexController.create_flow_template/_create_vm_for_random to build
-    packet templates. It supports adding flows to selected ports (on-device) or saving
-    them locally if not connected. Also lists existing flows per port with action buttons.
+    支持通过预设层组合构建报文，并为每个占位字段提供模式配置（fixed/inc/dec/random）。
+    composition is list of dict:
+      {
+        'family': 'L3',
+        'preset_id': 'ipv4',
+        'name': 'IPv4',
+        'template': "IP(src='{src_ip}', dst='{dst_ip}')",
+        'fields': {
+            'src_ip': {'mode':'fixed','value':'1.2.3.4', 'start':'16.0.0.1','end':'16.0.0.1','step':1},
+        }
+      }
     """
     def __init__(self, controller, parent=None):
         super().__init__(parent)
         self.controller = controller
         self.parent_window = parent
-        self.editing = None  # (port, index) if editing an existing flow
+        self.composition = []
         self._build_ui()
 
     def _build_ui(self):
         layout = QVBoxLayout()
         self.setLayout(layout)
 
-        # Basic ethernet / flow identification
-        eth_group = QGroupBox("基本以太网 / 流信息")
-        eth_l = QVBoxLayout()
-        eth_group.setLayout(eth_l)
-
-        row = QHBoxLayout()
-        row.addWidget(QLabel("流类型:"))
-        self.flow_type_cb = QComboBox()
-        self.flow_type_cb.addItems(["UDP", "TCP", "HTTP", "ICMP"])
-        row.addWidget(self.flow_type_cb)
-
-        row.addWidget(QLabel("流名称:"))
+        base_row = QHBoxLayout()
+        base_row.addWidget(QLabel("流名称:"))
         self.flow_name_le = QLineEdit(f"flow_{int(time.time())}")
-        row.addWidget(self.flow_name_le)
-        eth_l.addLayout(row)
-
-        mac_row = QHBoxLayout()
-        mac_row.addWidget(QLabel("源MAC:"))
+        base_row.addWidget(self.flow_name_le)
+        base_row.addWidget(QLabel("源MAC:"))
         self.src_mac_le = QLineEdit("00:03:00:01:40:01")
-        mac_row.addWidget(self.src_mac_le)
-        mac_row.addWidget(QLabel("目的MAC:"))
+        base_row.addWidget(self.src_mac_le)
+        base_row.addWidget(QLabel("目的MAC:"))
         self.dst_mac_le = QLineEdit("00:02:00:03:04:02")
-        mac_row.addWidget(self.dst_mac_le)
-        eth_l.addLayout(mac_row)
+        base_row.addWidget(self.dst_mac_le)
+        layout.addLayout(base_row)
 
-        layout.addWidget(eth_group)
-
-        # IP / port configuration
-        ip_group = QGroupBox("IP / 端口 配置")
-        ip_l = QVBoxLayout()
-        ip_group.setLayout(ip_l)
-
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("源IP:"))
+        ip_row = QHBoxLayout()
+        ip_row.addWidget(QLabel("源IP:"))
         self.src_ip_le = QLineEdit("16.0.0.1")
-        row1.addWidget(self.src_ip_le)
-        row1.addWidget(QLabel("目的IP:"))
+        ip_row.addWidget(self.src_ip_le)
+        ip_row.addWidget(QLabel("目的IP:"))
         self.dst_ip_le = QLineEdit("48.0.0.1")
-        row1.addWidget(self.dst_ip_le)
-        ip_l.addLayout(row1)
+        ip_row.addWidget(self.dst_ip_le)
+        ip_row.addWidget(QLabel("源端口:"))
+        self.src_port_sb = QSpinBox(); self.src_port_sb.setRange(1,65535); self.src_port_sb.setValue(1025)
+        ip_row.addWidget(self.src_port_sb)
+        ip_row.addWidget(QLabel("目的端口:"))
+        self.dst_port_sb = QSpinBox(); self.dst_port_sb.setRange(1,65535); self.dst_port_sb.setValue(80)
+        ip_row.addWidget(self.dst_port_sb)
+        layout.addLayout(ip_row)
 
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel("源端口:"))
-        self.src_port_sb = QSpinBox(); self.src_port_sb.setRange(1, 65535); self.src_port_sb.setValue(1025)
-        row2.addWidget(self.src_port_sb)
-        row2.addWidget(QLabel("目的端口:"))
-        self.dst_port_sb = QSpinBox(); self.dst_port_sb.setRange(1, 65535); self.dst_port_sb.setValue(80)
-        row2.addWidget(self.dst_port_sb)
-        ip_l.addLayout(row2)
+        # Preset selection
+        presets_box = QGroupBox("层预设（选择后点击 Add Layer）")
+        pbl = QVBoxLayout(); presets_box.setLayout(pbl)
+        sel_row = QHBoxLayout()
+        sel_row.addWidget(QLabel("层类型:"))
+        self.family_cb = QComboBox()
+        self.family_cb.addItems(['L2','L3','L4','TUNNEL'])
+        self.family_cb.currentTextChanged.connect(self._on_family_changed)
+        sel_row.addWidget(self.family_cb)
+        sel_row.addWidget(QLabel("预设:"))
+        self.preset_cb = QComboBox()
+        sel_row.addWidget(self.preset_cb)
+        self.add_layer_btn = QPushButton("Add Layer"); self.add_layer_btn.clicked.connect(self.on_add_layer)
+        sel_row.addWidget(self.add_layer_btn)
+        pbl.addLayout(sel_row)
 
-        layout.addWidget(ip_group)
-
-        # Randomization options
-        rand_group = QGroupBox("随机化选项（可选）")
-        rand_l = QVBoxLayout()
-        rand_group.setLayout(rand_l)
-
-        # source IP randomization
-        sip_row = QHBoxLayout()
-        self.rand_sip_cb = QCheckBox("随机源IP（网段）")
-        sip_row.addWidget(self.rand_sip_cb)
-        sip_row.addWidget(QLabel("开始:"))
-        self.sip_start_le = QLineEdit("192.168.1.1")
-        sip_row.addWidget(self.sip_start_le)
-        sip_row.addWidget(QLabel("结束:"))
-        self.sip_end_le = QLineEdit("192.168.1.100")
-        sip_row.addWidget(self.sip_end_le)
-        rand_l.addLayout(sip_row)
-
-        # dst IP randomization
-        dip_row = QHBoxLayout()
-        self.rand_dip_cb = QCheckBox("随机目的IP（网段）")
-        dip_row.addWidget(self.rand_dip_cb)
-        dip_row.addWidget(QLabel("开始:"))
-        self.dip_start_le = QLineEdit("192.168.2.1")
-        dip_row.addWidget(self.dip_start_le)
-        dip_row.addWidget(QLabel("结束:"))
-        self.dip_end_le = QLineEdit("192.168.2.100")
-        dip_row.addWidget(self.dip_end_le)
-        rand_l.addLayout(dip_row)
-
-        # random ports
-        sport_row = QHBoxLayout()
-        self.rand_sport_cb = QCheckBox("随机源端口")
-        sport_row.addWidget(self.rand_sport_cb)
-        sport_row.addWidget(QLabel("开始:"))
-        self.sport_start_sb = QSpinBox(); self.sport_start_sb.setRange(1,65535); self.sport_start_sb.setValue(10000)
-        sport_row.addWidget(self.sport_start_sb)
-        sport_row.addWidget(QLabel("结束:"))
-        self.sport_end_sb = QSpinBox(); self.sport_end_sb.setRange(1,65535); self.sport_end_sb.setValue(11000)
-        sport_row.addWidget(self.sport_end_sb)
-        rand_l.addLayout(sport_row)
-
-        dport_row = QHBoxLayout()
-        self.rand_dport_cb = QCheckBox("随机目的端口")
-        dport_row.addWidget(self.rand_dport_cb)
-        dport_row.addWidget(QLabel("开始:"))
-        self.dport_start_sb = QSpinBox(); self.dport_start_sb.setRange(1,65535); self.dport_start_sb.setValue(20000)
-        dport_row.addWidget(self.dport_start_sb)
-        dport_row.addWidget(QLabel("结束:"))
-        self.dport_end_sb = QSpinBox(); self.dport_end_sb.setRange(1,65535); self.dport_end_sb.setValue(21000)
-        dport_row.addWidget(self.dport_end_sb)
-        rand_l.addLayout(dport_row)
-
-        # random packet size
-        pkt_row = QHBoxLayout()
-        self.rand_pkt_cb = QCheckBox("随机包长")
-        pkt_row.addWidget(self.rand_pkt_cb)
-        pkt_row.addWidget(QLabel("最小:"))
-        self.pkt_min_sb = QSpinBox(); self.pkt_min_sb.setRange(64, 9000); self.pkt_min_sb.setValue(64)
-        pkt_row.addWidget(self.pkt_min_sb)
-        pkt_row.addWidget(QLabel("最大:"))
-        self.pkt_max_sb = QSpinBox(); self.pkt_max_sb.setRange(64, 9732); self.pkt_max_sb.setValue(1518)
-        pkt_row.addWidget(self.pkt_max_sb)
-        rand_l.addLayout(pkt_row)
-
-        layout.addWidget(rand_group)
-
-        # VLAN / other settings
-        misc_group = QGroupBox("其他设置")
-        misc_l = QVBoxLayout()
-        misc_group.setLayout(misc_l)
-
-        vlan_row = QHBoxLayout()
-        self.vlan_cb = QCheckBox("启用 VLAN")
-        vlan_row.addWidget(self.vlan_cb)
-        vlan_row.addWidget(QLabel("VLAN ID:"))
-        self.vlan_id_sb = QSpinBox(); self.vlan_id_sb.setRange(1, 4094); self.vlan_id_sb.setValue(100)
-        vlan_row.addWidget(self.vlan_id_sb)
-        vlan_row.addWidget(QLabel("优先级:"))
-        self.vlan_prio_sb = QSpinBox(); self.vlan_prio_sb.setRange(0,7); self.vlan_prio_sb.setValue(0)
-        vlan_row.addWidget(self.vlan_prio_sb)
-        misc_l.addLayout(vlan_row)
-
-        size_row = QHBoxLayout()
-        size_row.addWidget(QLabel("帧大小 (字节):"))
-        self.pkt_size_sb = QSpinBox(); self.pkt_size_sb.setRange(64, 9732); self.pkt_size_sb.setValue(512)
-        size_row.addWidget(self.pkt_size_sb)
-        size_row.addWidget(QLabel("速率 (%):"))
-        self.rate_ds = QDoubleSpinBox(); self.rate_ds.setRange(0.1, 100.0); self.rate_ds.setValue(10.0)
-        size_row.addWidget(self.rate_ds)
-        misc_l.addLayout(size_row)
-
-        layout.addWidget(misc_group)
-
-        # port selection & actions
-        action_group = QGroupBox("目标端口与操作")
-        action_l = QVBoxLayout()
-        action_group.setLayout(action_l)
-
-        top_row = QHBoxLayout()
-        top_row.addWidget(QLabel("目标端口 (支持逗号/范围):"))
-        self.target_ports_le = QLineEdit("0")
-        top_row.addWidget(self.target_ports_le)
-
-        top_row.addWidget(QLabel("查看端口:"))
-        self.view_port_combo = QComboBox()
-        self.view_port_combo.addItems(["0","1","2","3"])
-        self.view_port_combo.currentIndexChanged.connect(self.on_view_port_changed)
-        top_row.addWidget(self.view_port_combo)
-
-        action_l.addLayout(top_row)
-
+        # Composition list and field editor
+        comp_row = QHBoxLayout()
+        left_v = QVBoxLayout()
+        left_v.addWidget(QLabel("Composition (按顺序)"))
+        self.composition_list = QListWidget()
+        self.composition_list.currentRowChanged.connect(self.on_composition_selection_changed)
+        left_v.addWidget(self.composition_list)
         btn_row = QHBoxLayout()
-        self.add_to_device_btn = QPushButton("下发到 T-Rex 并保存")
-        self.add_to_device_btn.clicked.connect(self.on_add_to_device)
-        btn_row.addWidget(self.add_to_device_btn)
+        self.up_btn = QPushButton("Up"); self.up_btn.clicked.connect(self.on_move_up)
+        self.down_btn = QPushButton("Down"); self.down_btn.clicked.connect(self.on_move_down)
+        self.remove_btn = QPushButton("Remove"); self.remove_btn.clicked.connect(self.on_remove_layer)
+        btn_row.addWidget(self.up_btn); btn_row.addWidget(self.down_btn); btn_row.addWidget(self.remove_btn)
+        left_v.addLayout(btn_row)
+        comp_row.addLayout(left_v)
 
-        self.save_local_btn = QPushButton("仅保存本地配置")
-        self.save_local_btn.clicked.connect(self.on_save_local)
-        btn_row.addWidget(self.save_local_btn)
+        right_v = QVBoxLayout()
+        right_v.addWidget(QLabel("Selected Layer Fields (mode: fixed/inc/dec/random)"))
+        # Table: Field | Mode | Value/Start | End | Step
+        self.field_table = QTableWidget(0,5)
+        self.field_table.setHorizontalHeaderLabels(['Field','Mode','Value/Start','End','Step'])
+        self.field_table.horizontalHeader().setStretchLastSection(True)
+        right_v.addWidget(self.field_table)
+        # Apply changes button
+        self.apply_fields_btn = QPushButton("Apply Field Changes"); self.apply_fields_btn.clicked.connect(self.on_apply_field_changes)
+        right_v.addWidget(self.apply_fields_btn)
+        comp_row.addLayout(right_v)
 
-        self.validate_btn = QPushButton("校验参数")
-        self.validate_btn.clicked.connect(self.on_validate)
-        btn_row.addWidget(self.validate_btn)
+        pbl.addLayout(comp_row)
+        pbl.addWidget(QLabel("组合报文预览:"))
+        self.preview_te = QTextEdit(); self.preview_te.setReadOnly(True); self.preview_te.setMaximumHeight(140)
+        pbl.addWidget(self.preview_te)
 
-        self.save_changes_btn = QPushButton("保存变更")
-        self.save_changes_btn.clicked.connect(self.on_save_changes)
-        self.save_changes_btn.setEnabled(False)
-        btn_row.addWidget(self.save_changes_btn)
+        layout.addWidget(presets_box)
 
-        action_l.addLayout(btn_row)
-        layout.addWidget(action_group)
+        action_row = QHBoxLayout()
+        action_row.addWidget(QLabel("目标端口 (逗号/范围):"))
+        self.target_ports_le = QLineEdit("0")
+        action_row.addWidget(self.target_ports_le)
+        self.save_local_btn = QPushButton("仅保存本地配置"); self.save_local_btn.clicked.connect(self.on_save_local)
+        action_row.addWidget(self.save_local_btn)
+        self.add_to_device_btn = QPushButton("下发到 T-Rex 并保存"); self.add_to_device_btn.clicked.connect(self.on_add_to_device)
+        action_row.addWidget(self.add_to_device_btn)
+        layout.addLayout(action_row)
 
-        # flow list table (per view_port)
-        list_group = QGroupBox("端口流列表")
-        list_l = QVBoxLayout()
-        list_group.setLayout(list_l)
+        self.status_te = QTextEdit(); self.status_te.setReadOnly(True); self.status_te.setMaximumHeight(140)
+        layout.addWidget(self.status_te)
 
-        self.flow_table = QTableWidget()
-        self.flow_table.setColumnCount(6)
-        self.flow_table.setHorizontalHeaderLabels(["名称","类型","速率","PGID","状态","操作"])
-        self.flow_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        list_l.addWidget(self.flow_table)
+        # initialize presets combobox
+        self._on_family_changed(self.family_cb.currentText())
 
-        refresh_row = QHBoxLayout()
-        self.refresh_btn = QPushButton("刷新列表")
-        self.refresh_btn.clicked.connect(self.on_refresh_clicked)
-        refresh_row.addWidget(self.refresh_btn)
-        list_l.addLayout(refresh_row)
-
-        layout.addWidget(list_group)
-
-        # status/log area
-        self.status_text = QTextEdit()
-        self.status_text.setReadOnly(True)
-        self.status_text.setMaximumHeight(160)
-        layout.addWidget(self.status_text)
-
-        # initial state
-        self._update_ui_state()
-        # refresh initial list for view_port 0
-        self.refresh_flow_list_for_port(int(self.view_port_combo.currentText()))
-
-    # ----------------------- UI helpers -----------------------
-    def _update_ui_state(self):
-        # enable/disable fields based on checkboxes (simple)
-        def toggle_enabled(cb, widgets):
-            for w in widgets:
-                w.setEnabled(cb.isChecked())
-        toggle_enabled(self.rand_sip_cb, [self.sip_start_le, self.sip_end_le])
-        toggle_enabled(self.rand_dip_cb, [self.dip_start_le, self.dip_end_le])
-        toggle_enabled(self.rand_sport_cb, [self.sport_start_sb, self.sport_end_sb])
-        toggle_enabled(self.rand_dport_cb, [self.dport_start_sb, self.dport_end_sb])
-        toggle_enabled(self.rand_pkt_cb, [self.pkt_min_sb, self.pkt_max_sb])
-        toggle_enabled(self.vlan_cb, [self.vlan_id_sb, self.vlan_prio_sb])
-
-        # connect checkboxes to toggles
-        self.rand_sip_cb.toggled.connect(lambda _: self._update_ui_state())
-        self.rand_dip_cb.toggled.connect(lambda _: self._update_ui_state())
-        self.rand_sport_cb.toggled.connect(lambda _: self._update_ui_state())
-        self.rand_dport_cb.toggled.connect(lambda _: self._update_ui_state())
-        self.rand_pkt_cb.toggled.connect(lambda _: self._update_ui_state())
-        self.vlan_cb.toggled.connect(lambda _: self._update_ui_state())
-
-    def append_status(self, msg: str, level: str = "信息"):
+    # ---------------- UI helpers ----------------
+    def append_status(self, msg, level="信息"):
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        self.status_text.append(f"[{ts}] [{level}] {msg}")
-        # also forward to main log if possible
-        if self.parent_window and hasattr(self.parent_window, "log_message"):
-            try:
-                self.parent_window.log_message(msg, level)
-            except Exception:
-                pass
+        self.status_te.append(f"[{ts}] [{level}] {msg}")
 
-    # ----------------------- parameter collection & validation -----------------------
+    def _on_family_changed(self, family):
+        self.preset_cb.clear()
+        for p in LAYER_PRESETS.get(family, []):
+            self.preset_cb.addItem(p['name'], p)
+
+    # ---------------- Composition operations ----------------
+    def on_add_layer(self):
+        preset = self.preset_cb.currentData()
+        if not preset:
+            QMessageBox.warning(self, "错误", "未选择预设")
+            return
+        template = preset['template']
+        # initial fields extracted from template placeholders
+        placeholders = extract_placeholders(template)
+        fields = {}
+        # default values taken from UI base fields where appropriate
+        defaults = {
+            'src_mac': self.src_mac_le.text().strip(),
+            'dst_mac': self.dst_mac_le.text().strip(),
+            'src_ip': self.src_ip_le.text().strip(),
+            'dst_ip': self.dst_ip_le.text().strip(),
+            'src_port': int(self.src_port_sb.value()),
+            'dst_port': int(self.dst_port_sb.value()),
+            'vlan_id': 100,
+            'vlan_prio': 0
+        }
+        for ph in placeholders:
+            # set default end to same as start/value to provide a sensible default
+            fld = {'mode':'fixed', 'value':defaults.get(ph, ''), 'start':defaults.get(ph, ''), 'end':defaults.get(ph, ''), 'step':1}
+            fields[ph] = fld
+        layer = {
+            'family': self.family_cb.currentText(),
+            'preset_id': preset['id'],
+            'name': preset['name'],
+            'template': template,
+            'fields': fields
+        }
+        self.composition.append(layer)
+        self.composition_list.addItem(QListWidgetItem(f"{layer['family']} - {layer['name']}"))
+        self.update_preview()
+        self.append_status(f"Added layer {layer['family']} {layer['name']}")
+
+    def on_move_up(self):
+        i = self.composition_list.currentRow()
+        if i > 0:
+            self.composition[i-1], self.composition[i] = self.composition[i], self.composition[i-1]
+            item = self.composition_list.takeItem(i)
+            self.composition_list.insertItem(i-1, item)
+            self.composition_list.setCurrentRow(i-1)
+            self.update_preview()
+
+    def on_move_down(self):
+        i = self.composition_list.currentRow()
+        if i >= 0 and i < len(self.composition)-1:
+            self.composition[i+1], self.composition[i] = self.composition[i], self.composition[i+1]
+            item = self.composition_list.takeItem(i)
+            self.composition_list.insertItem(i+1, item)
+            self.composition_list.setCurrentRow(i+1)
+            self.update_preview()
+
+    def on_remove_layer(self):
+        i = self.composition_list.currentRow()
+        if i >= 0:
+            self.composition.pop(i)
+            self.composition_list.takeItem(i)
+            self.field_table.setRowCount(0)
+            self.update_preview()
+
+    def update_preview(self):
+        if not self.composition:
+            self.preview_te.setPlainText("<empty>")
+            return
+        parts = []
+        for layer in self.composition:
+            # create a shallow preview: replace placeholders using current 'value' if fixed, else show placeholder
+            tpl = layer.get('template', '')
+            vals = {}
+            for k, v in layer.get('fields', {}).items():
+                if v.get('mode') == 'fixed':
+                    vals[k] = v.get('value', '')
+                else:
+                    vals[k] = "{" + k + "}"
+            try:
+                part = tpl.format(**vals)
+            except Exception:
+                part = tpl
+            parts.append(part)
+        expr = " / ".join(parts)
+        self.preview_te.setPlainText(expr)
+
+    def on_composition_selection_changed(self, idx):
+        self.field_table.setRowCount(0)
+        if idx < 0 or idx >= len(self.composition):
+            return
+        layer = self.composition[idx]
+        fields = layer.get('fields', {})
+        self.field_table.setRowCount(len(fields))
+        for r, (fname, fcfg) in enumerate(fields.items()):
+            # Field name
+            it = QTableWidgetItem(fname)
+            it.setFlags(Qt.ItemIsEnabled)
+            self.field_table.setItem(r, 0, it)
+            # Mode combo
+            mode_cb = QComboBox()
+            mode_cb.addItems(FIELD_MODES)
+            mode_cb.setCurrentText(fcfg.get('mode', 'fixed'))
+            self.field_table.setCellWidget(r, 1, mode_cb)
+            # Value/Start
+            val_it = QTableWidgetItem(str(fcfg.get('value', '')))
+            self.field_table.setItem(r, 2, val_it)
+            # End
+            end_it = QTableWidgetItem(str(fcfg.get('end', '')))
+            self.field_table.setItem(r, 3, end_it)
+            # Step
+            step_it = QTableWidgetItem(str(fcfg.get('step', 1)))
+            self.field_table.setItem(r, 4, step_it)
+
+    def on_apply_field_changes(self):
+        idx = self.composition_list.currentRow()
+        if idx < 0 or idx >= len(self.composition):
+            return
+        layer = self.composition[idx]
+        new_fields = {}
+        for r in range(self.field_table.rowCount()):
+            fname = self.field_table.item(r,0).text()
+            mode_cb = self.field_table.cellWidget(r,1)
+            mode = mode_cb.currentText() if mode_cb else 'fixed'
+            val = self.field_table.item(r,2).text() if self.field_table.item(r,2) else ''
+            end = self.field_table.item(r,3).text() if self.field_table.item(r,3) else ''
+            step_s = self.field_table.item(r,4).text() if self.field_table.item(r,4) else '1'
+            try:
+                step = int(step_s)
+            except Exception:
+                step = 1
+            # ensure start/end defaults remain sensible: if start empty use value; if end empty use start/value
+            start_val = val if val else ''
+            end_val = end if end else start_val
+            new_fields[fname] = {'mode': mode, 'value': val, 'start': start_val, 'end': end_val, 'step': step}
+        layer['fields'] = new_fields
+        self.composition[idx] = layer
+        self.update_preview()
+        self.append_status(f"Updated fields for layer {layer.get('name')}")
+
+    # ---------------- Parameter collection ----------------
     def _collect_params(self):
-        """
-        Collect parameters from UI controls and return (params_dict, error_message)
-        If validation fails, params_dict is None and error_message contains the reason.
-        """
-        params = {}
         try:
+            params = {}
+            params['name'] = self.flow_name_le.text().strip() or f"flow_{int(time.time())}"
             params['src_mac'] = self.src_mac_le.text().strip()
             params['dst_mac'] = self.dst_mac_le.text().strip()
             params['src_ip'] = self.src_ip_le.text().strip()
             params['dst_ip'] = self.dst_ip_le.text().strip()
             params['src_port'] = int(self.src_port_sb.value())
             params['dst_port'] = int(self.dst_port_sb.value())
-            params['vlan_enabled'] = bool(self.vlan_cb.isChecked())
-            params['vlan_id'] = int(self.vlan_id_sb.value())
-            params['vlan_prio'] = int(self.vlan_prio_sb.value())
-            params['pkt_size'] = int(self.pkt_size_sb.value())
-            params['rate'] = float(self.rate_ds.value())
-
-            # random flags and ranges
-            params['random_src_ip'] = bool(self.rand_sip_cb.isChecked())
-            params['sip_range_start'] = self.sip_start_le.text().strip()
-            params['sip_range_end'] = self.sip_end_le.text().strip()
-
-            params['random_dst_ip'] = bool(self.rand_dip_cb.isChecked())
-            params['dip_range_start'] = self.dip_start_le.text().strip()
-            params['dip_range_end'] = self.dip_end_le.text().strip()
-
-            params['random_src_port'] = bool(self.rand_sport_cb.isChecked())
-            params['sport_range_start'] = int(self.sport_start_sb.value())
-            params['sport_range_end'] = int(self.sport_end_sb.value())
-
-            params['random_dst_port'] = bool(self.rand_dport_cb.isChecked())
-            params['dport_range_start'] = int(self.dport_start_sb.value())
-            params['dport_range_end'] = int(self.dport_end_sb.value())
-
-            params['random_pkt_size'] = bool(self.rand_pkt_cb.isChecked())
-            params['pkt_size_min'] = int(self.pkt_min_sb.value())
-            params['pkt_size_max'] = int(self.pkt_max_sb.value())
-
-            # name/type
-            params['name'] = self.flow_name_le.text().strip() or f"flow_{int(time.time())}"
-            params['type'] = self.flow_type_cb.currentText().upper()
-
-            # validate IPs and ranges
-            if params['random_src_ip']:
-                try:
-                    ipaddress.IPv4Address(params['sip_range_start'])
-                    ipaddress.IPv4Address(params['sip_range_end'])
-                except Exception:
-                    return None, "随机源IP段格式不正确"
-            else:
-                # validate single IP
-                try:
-                    ipaddress.IPv4Address(params['src_ip'])
-                except Exception:
-                    return None, "源IP格式不正确"
-
-            if params['random_dst_ip']:
-                try:
-                    ipaddress.IPv4Address(params['dip_range_start'])
-                    ipaddress.IPv4Address(params['dip_range_end'])
-                except Exception:
-                    return None, "随机目的IP段格式不正确"
-            else:
-                try:
-                    ipaddress.IPv4Address(params['dst_ip'])
-                except Exception:
-                    return None, "目的IP格式不正确"
-
-            # ports ranges
-            if params['random_src_port']:
-                if not (1 <= params['sport_range_start'] <= params['sport_range_end'] <= 65535):
-                    return None, "源端口范围不正确"
-            if params['random_dst_port']:
-                if not (1 <= params['dport_range_start'] <= params['dport_range_end'] <= 65535):
-                    return None, "目的端口范围不正确"
-
-            # pkt size random
-            if params['random_pkt_size']:
-                if not (64 <= params['pkt_size_min'] <= params['pkt_size_max'] <= 9732):
-                    return None, "随机包长范围不正确"
-
-            # target ports parsing
             ports_text = self.target_ports_le.text().strip()
             if not ports_text:
                 return None, "请填写目标端口"
@@ -382,12 +348,11 @@ class TrafficTab(QWidget):
                 p = p.strip()
                 if not p:
                     continue
-                # allow ranges like 0-3
                 if "-" in p:
                     try:
                         a,b = p.split("-",1)
-                        a=int(a); b=int(b)
-                        ports.extend(list(range(a, b+1)))
+                        a = int(a); b = int(b)
+                        ports.extend(range(a, b+1))
                     except Exception:
                         return None, f"端口范围格式错误: {p}"
                 else:
@@ -398,403 +363,152 @@ class TrafficTab(QWidget):
             if not ports:
                 return None, "未解析到有效目标端口"
             params['target_ports'] = sorted(list(set(ports)))
-
+            params['composition'] = [dict(x) for x in self.composition]
             return params, None
         except Exception as e:
             traceback.print_exc()
             return None, f"参数收集异常: {e}"
 
-    # ----------------------- actions -----------------------
-    def on_validate(self):
-        params, err = self._collect_params()
-        if err:
-            QMessageBox.warning(self, "校验失败", err)
-            self.append_status(err, "错误")
-            return
-        self.append_status("参数校验通过", "信息")
-        QMessageBox.information(self, "校验通过", "参数看起来合法，可以继续下发或保存。")
-
-    def on_save_local(self):
-        params, err = self._collect_params()
-        if err:
-            QMessageBox.warning(self, "保存失败", err)
-            self.append_status(err, "错误")
-            return
-        # save to controller local config for each port
-        for port in params['target_ports']:
-            cfg = {
-                'name': params['name'],
-                'type': params['type'],
-                'params': params,
-                'tx_ports': [port],
-                'rx_ports': [port]
-            }
-            ok, msg = self.controller.add_flow_to_port(port, cfg)
-            if ok:
-                self.append_status(f"已保存本地流配置: 端口 {port} ({msg})", "信息")
-            else:
-                self.append_status(f"保存本地流失败: 端口 {port} ({msg})", "错误")
-        # refresh list view port if affected
+    # ---------------- Field value resolution ----------------
+    def _is_ip(self, s: str):
         try:
-            self.refresh_flow_list_for_port(int(self.view_port_combo.currentText()))
+            if ':' in str(s):
+                ipaddress.IPv6Address(str(s))
+            else:
+                ipaddress.IPv4Address(str(s))
+            return True
         except Exception:
-            pass
+            return False
 
-    def on_add_to_device(self):
+    def _ip_to_int(self, ip_s):
+        if ':' in str(ip_s):
+            return int(ipaddress.IPv6Address(ip_s))
+        return int(ipaddress.IPv4Address(ip_s))
+
+    def _int_to_ip(self, i, v6=False):
+        if v6:
+            return str(ipaddress.IPv6Address(i))
+        return str(ipaddress.IPv4Address(i))
+
+    def resolve_field_value(self, field_cfg: dict, seq_index: int):
         """
-        Build flow using controller.create_flow_template and add to device (if connected).
-        If not connected, fall back to saving locally.
+        field_cfg: {'mode','value','start','end','step'}
+        seq_index: zero-based index used for inc/dec
         """
-        params, err = self._collect_params()
-        if err:
-            QMessageBox.warning(self, "参数错误", err)
-            self.append_status(err, "错误")
-            return
-
-        # create template from controller
-        try:
-            template = None
-            if hasattr(self.controller, 'create_flow_template'):
-                template = self.controller.create_flow_template(params['type'])
-            if template is None:
-                QMessageBox.warning(self, "创建失败", f"控制器不支持流类型 {params['type']} 的模板，已保存本地配置")
-                self.on_save_local()
-                return
-
-            # build packet using template; template may internally call controller._create_vm_for_random
-            pkt_obj = None
+        mode = field_cfg.get('mode', 'fixed')
+        if mode == 'fixed':
+            return field_cfg.get('value', '')
+        if mode == 'random':
+            start = field_cfg.get('start', '')
+            end = field_cfg.get('end', '')
+            # Try IP range (v4 or v6)
             try:
-                pkt_obj = template['packet'](params)
-            except Exception as e:
-                # fallback: try to create VM via controller and re-run
-                try:
-                    vm = None
-                    if hasattr(self.controller, '_create_vm_for_random'):
-                        vm = self.controller._create_vm_for_random(params['type'], params)
-                        params_with_vm = dict(params)
-                        params_with_vm['vm'] = vm
-                        pkt_obj = template['packet'](params_with_vm)
-                    else:
-                        raise
-                except Exception as e2:
-                    traceback.print_exc()
-                    self.append_status(f"构建数据包失败: {e2}", "错误")
-                    QMessageBox.warning(self, "构建失败", f"数据包构建失败: {e2}\n已保存本地配置")
-                    self.on_save_local()
-                    return
-
-            # normalize to STLPktBuilder if TREX available
-            pkt_builder = None
-            if TREX_STL_AVAILABLE and isinstance(pkt_obj, STLPktBuilder):
-                pkt_builder = pkt_obj
-            else:
-                if TREX_STL_AVAILABLE:
-                    try:
-                        pkt_builder = STLPktBuilder(pkt=pkt_obj)
-                    except Exception as e:
-                        traceback.print_exc()
-                        pkt_builder = None
+                if ':' in str(start) or ':' in str(end):
+                    s = self._ip_to_int(start); e = self._ip_to_int(end)
+                    if s > e:
+                        s, e = e, s
+                    val = random.randint(s, e)
+                    return self._int_to_ip(val, v6=True)
                 else:
-                    pkt_builder = None
-
-            # If not connected to real T-Rex or packet builder missing, fallback to save local
-            if not getattr(self.controller, 'is_connected', False) or not getattr(self.controller, 'client', None) or pkt_builder is None:
-                self.append_status("未连接到 T-Rex 或无法构建 STLPktBuilder，已保存本地配置", "警告")
-                self.on_save_local()
-                return
-
-            # add streams to each target port with unique PGID
-            for port in params['target_ports']:
-                try:
-                    if port not in self.controller.flow_configs:
-                        self.controller.flow_configs[port] = []
-
-                    base_pgid = (port + 1) * 1000
-                    flow_index = len(self.controller.flow_configs[port])
-                    pgid = base_pgid + flow_index + 1
-
-                    rate = float(params.get('rate', 50.0))
-                    stream = STLStream(packet=pkt_builder, mode=STLTXCont(percentage=rate), flow_stats=STLFlowStats(pg_id=pgid))
-
-                    # send to trex
-                    self.controller.client.add_streams(stream, ports=[port])
-
-                    # store in controller config
-                    stored = {
-                        'name': params['name'],
-                        'type': params['type'],
-                        'params': params,
-                        'pgid': pgid,
-                        'stream': stream,
-                        'tx_ports': [port],
-                        'rx_ports': [port],
-                        'active': False
-                    }
-                    self.controller.flow_configs[port].append(stored)
-                    self.append_status(f"已下发流到 T-Rex (port={port}, pgid={pgid})", "信息")
-                except Exception as e:
-                    traceback.print_exc()
-                    self.append_status(f"端口 {port} 下发失败: {e}", "错误")
-                    QMessageBox.warning(self, "下发失败", f"端口 {port} 下发失败: {e}")
-
-            # refresh UI list
-            try:
-                self.refresh_flow_list_for_port(int(self.view_port_combo.currentText()))
+                    s = self._ip_to_int(start); e = self._ip_to_int(end)
+                    if s > e:
+                        s, e = e, s
+                    val = random.randint(s, e)
+                    return self._int_to_ip(val)
             except Exception:
                 pass
+            # numeric fallback
+            try:
+                s = int(start); e = int(end)
+                if s > e:
+                    s, e = e, s
+                return str(random.randint(s, e))
+            except Exception:
+                # fallback to choose from comma separated list if provided
+                opts = (str(start) + ',' + str(end)).split(',')
+                opts = [x.strip() for x in opts if x.strip()]
+                if opts:
+                    return random.choice(opts)
+                return field_cfg.get('value', '')
+        if mode in ('inc', 'dec'):
+            # base is start (or value), step default field_cfg.step
+            try:
+                base_s = field_cfg.get('start', field_cfg.get('value', ''))
+                step = int(field_cfg.get('step', 1))
+                # IP sequence (supports v4/v6)
+                if ':' in str(base_s):
+                    base = self._ip_to_int(base_s)
+                    if mode == 'inc':
+                        val = base + seq_index * step
+                    else:
+                        val = base - seq_index * step
+                    return self._int_to_ip(val, v6=True)
+                else:
+                    base = int(base_s)
+                    if mode == 'inc':
+                        val = base + seq_index * step
+                    else:
+                        val = base - seq_index * step
+                    return str(val)
+            except Exception:
+                return field_cfg.get('value', '')
+        # fallback
+        return field_cfg.get('value', '')
 
-        except Exception as e:
-            traceback.print_exc()
-            self.append_status(f"下发异常: {e}", "错误")
-            QMessageBox.critical(self, "异常", f"下发异常: {e}")
+    # ---------------- Build packet from composition ----------------
+    def build_packet_from_composition_for_index(self, composition, seq_index):
+        """
+        Build concrete expression for one sequence index (used when adding streams).
+        Returns composed expr (string) and, if possible, scapy.Packet object.
+        """
+        parts = []
+        for layer in composition:
+            tpl = layer.get('template', '')
+            fields = layer.get('fields', {})
+            subs = {}
+            for k, cfg in fields.items():
+                subs[k] = self.resolve_field_value(cfg, seq_index)
+            try:
+                part = tpl.format(**subs)
+            except Exception:
+                part = tpl
+            parts.append(part)
+        expr = " / ".join(parts)
+        if SCAPY_AVAILABLE:
+            try:
+                ctx = {
+                    'Ether': scapy.Ether,
+                    'Dot1Q': getattr(scapy, 'Dot1Q', None),
+                    'IP': scapy.IP,
+                    'IPv6': scapy.IPv6,
+                    'UDP': scapy.UDP,
+                    'TCP': scapy.TCP,
+                    'GRE': getattr(scapy, 'GRE', None),
+                    'Raw': scapy.Raw,
+                }
+                pkt = eval(expr, {}, ctx)
+                return expr, pkt
+            except Exception:
+                traceback.print_exc()
+                return expr, None
+        else:
+            return expr, None
 
-    # ----------------------- flow list & actions -----------------------
-    def on_view_port_changed(self):
+    # ---------------- Create streams from composition (trex VM generation supporting IPv6) ----------------
+    def create_streams_from_composition(self, params):
+        """
+        根据 params['composition'] 动态生成 STLVM 指令并构建 STLPktBuilder/STLStream 列表。
+        返回 (streams, err)：
+          - 当 trex 可用且 streams 生成成功： ( [STLStream, ...], None )
+          - 当 trex 不可用或失败： ( [ (size, pkt_template, vm_desc), ... ], "trex not available or error" )
+        支持 IPv4/IPv6：对 IP 字段会判断是否含 ':' 来决定 IPv6 处理。
+        """
+        import traceback
         try:
-            port = int(self.view_port_combo.currentText())
+            trex_ok = TREX_STL_AVAILABLE
         except Exception:
-            port = 0
-        self.refresh_flow_list_for_port(port)
+            trex_ok = False
 
-    def on_refresh_clicked(self):
         try:
-            port = int(self.view_port_combo.currentText())
+            scapy_ok = SCAPY_AVAILABLE
         except Exception:
-            port = 0
-        self.refresh_flow_list_for_port(port)
-
-    def refresh_flow_list_for_port(self, port: int):
-        """Populate the flow_table with flows for the given port."""
-        self.flow_table.setRowCount(0)
-        #flows = self.controller.get_port_flows(port)
-        flows = {}
-        for i, f in enumerate(flows):
-            row = self.flow_table.rowCount()
-            self.flow_table.insertRow(row)
-            self.flow_table.setItem(row, 0, QTableWidgetItem(f.get("name", f"flow_{i}")))
-            self.flow_table.setItem(row, 1, QTableWidgetItem(f.get("type", "")))
-            rate_text = str(f.get("params", {}).get("rate", f.get("rate", "")))
-            self.flow_table.setItem(row, 2, QTableWidgetItem(rate_text))
-            self.flow_table.setItem(row, 3, QTableWidgetItem(str(f.get("pgid", ""))))
-            status_text = "活跃" if f.get("active") else "停止"
-            status_item = QTableWidgetItem(status_text)
-            if f.get("active"):
-                status_item.setBackground(QColor(200,255,200))
-            else:
-                status_item.setBackground(QColor(255,200,200))
-            self.flow_table.setItem(row, 4, status_item)
-
-            # actions: Edit / Start / Stop / Delete
-            action_widget = QWidget()
-            h = QHBoxLayout()
-            h.setContentsMargins(0,0,0,0)
-            h.setSpacing(4)
-
-            edit_btn = QPushButton("编辑"); edit_btn.setMaximumWidth(60)
-            edit_btn.clicked.connect(partial(self.on_edit_flow, port, i))
-            h.addWidget(edit_btn)
-
-            start_btn = QPushButton("启动"); start_btn.setMaximumWidth(60)
-            start_btn.clicked.connect(partial(self.on_start_flow, port, i))
-            h.addWidget(start_btn)
-
-            stop_btn = QPushButton("停止"); stop_btn.setMaximumWidth(60)
-            stop_btn.clicked.connect(partial(self.on_stop_flow, port, i))
-            h.addWidget(stop_btn)
-
-            del_btn = QPushButton("删除"); del_btn.setMaximumWidth(60)
-            del_btn.clicked.connect(partial(self.on_delete_flow, port, i))
-            h.addWidget(del_btn)
-
-            action_widget.setLayout(h)
-            self.flow_table.setCellWidget(row, 5, action_widget)
-
-    def on_edit_flow(self, port: int, index: int):
-        """Load flow parameters into the form for editing."""
-        try:
-            flows = self.controller.get_port_flows(port)
-            if index < 0 or index >= len(flows):
-                self.append_status("所选流不存在", "错误")
-                return
-            f = flows[index]
-            params = f.get('params', {})
-            # populate fields (best-effort)
-            self.flow_name_le.setText(f.get('name', ''))
-            self.flow_type_cb.setCurrentText(f.get('type', 'UDP'))
-            self.src_mac_le.setText(params.get('src_mac', self.src_mac_le.text()))
-            self.dst_mac_le.setText(params.get('dst_mac', self.dst_mac_le.text()))
-            self.src_ip_le.setText(params.get('src_ip', self.src_ip_le.text()))
-            self.dst_ip_le.setText(params.get('dst_ip', self.dst_ip_le.text()))
-            self.src_port_sb.setValue(int(params.get('src_port', self.src_port_sb.value())))
-            self.dst_port_sb.setValue(int(params.get('dst_port', self.dst_port_sb.value())))
-            self.vlan_cb.setChecked(bool(params.get('vlan_enabled', False)))
-            self.vlan_id_sb.setValue(int(params.get('vlan_id', self.vlan_id_sb.value())))
-            self.vlan_prio_sb.setValue(int(params.get('vlan_prio', self.vlan_prio_sb.value())))
-            self.pkt_size_sb.setValue(int(params.get('pkt_size', self.pkt_size_sb.value())))
-            self.rate_ds.setValue(float(params.get('rate', self.rate_ds.value())))
-
-            # random flags
-            self.rand_sip_cb.setChecked(bool(params.get('random_src_ip', False)))
-            self.sip_start_le.setText(params.get('sip_range_start', self.sip_start_le.text()))
-            self.sip_end_le.setText(params.get('sip_range_end', self.sip_end_le.text()))
-            self.rand_dip_cb.setChecked(bool(params.get('random_dst_ip', False)))
-            self.dip_start_le.setText(params.get('dip_range_start', self.dip_start_le.text()))
-            self.dip_end_le.setText(params.get('dip_range_end', self.dip_end_le.text()))
-            self.rand_sport_cb.setChecked(bool(params.get('random_src_port', False)))
-            self.sport_start_sb.setValue(int(params.get('sport_range_start', self.sport_start_sb.value())))
-            self.sport_end_sb.setValue(int(params.get('sport_range_end', self.sport_end_sb.value())))
-            self.rand_dport_cb.setChecked(bool(params.get('random_dst_port', False)))
-            self.dport_start_sb.setValue(int(params.get('dport_range_start', self.dport_start_sb.value())))
-            self.dport_end_sb.setValue(int(params.get('dport_range_end', self.dport_end_sb.value())))
-            self.rand_pkt_cb.setChecked(bool(params.get('random_pkt_size', False)))
-            self.pkt_min_sb.setValue(int(params.get('pkt_size_min', self.pkt_min_sb.value())))
-            self.pkt_max_sb.setValue(int(params.get('pkt_size_max', self.pkt_max_sb.value())))
-
-            # set target ports to the flow's tx_ports
-            txp = f.get('tx_ports', [])
-            if txp:
-                self.target_ports_le.setText(",".join(str(x) for x in txp))
-
-            self.editing = (port, index)
-            self.save_changes_btn.setEnabled(True)
-            self.append_status(f"载入流进行编辑: 端口 {port} 索引 {index}", "信息")
-        except Exception as e:
-            traceback.print_exc()
-            self.append_status(f"载入编辑失败: {e}", "错误")
-
-    def on_save_changes(self):
-        """Apply edits to an existing flow (update controller.flow_configs and re-add to device if connected)."""
-        if not self.editing:
-            QMessageBox.warning(self, "无编辑项", "当前没有正在编辑的流")
-            return
-        port, index = self.editing
-        params, err = self._collect_params()
-        if err:
-            QMessageBox.warning(self, "参数错误", err)
-            self.append_status(err, "错误")
-            return
-        try:
-            flows = self.controller.get_port_flows(port)
-            if index < 0 or index >= len(flows):
-                QMessageBox.warning(self, "索引错误", "所编辑的流已不存在")
-                self.append_status("所编辑的流已不存在", "错误")
-                self.editing = None
-                self.save_changes_btn.setEnabled(False)
-                return
-
-            # update local config
-            flows[index]['name'] = params.get('name', flows[index].get('name'))
-            flows[index]['params'] = params
-            flows[index]['type'] = params.get('type', flows[index].get('type'))
-
-            # if connected, re-add stream: remove all streams on port and re-add stored configs (controller handles re-adding in remove_flow_from_port)
-            if getattr(self.controller, 'is_connected', False) and getattr(self.controller, 'client', None):
-                # remove all streams and re-create from controller.flow_configs
-                try:
-                    # Use controller.clear_port_flows to remove streams and re-add from configs
-                    # Implement re-add: remove all device streams, then for each config create stream and add_streams
-                    try:
-                        self.controller.client.remove_all_streams(ports=[port])
-                    except Exception:
-                        pass
-                    # Rebuild streams for all flows on this port
-                    for idx, fc in enumerate(self.controller.flow_configs.get(port, [])):
-                        tpl = None
-                        if hasattr(self.controller, 'create_flow_template'):
-                            tpl = self.controller.create_flow_template(fc.get('type'))
-                        if tpl:
-                            try:
-                                params = tpl['default_params'].copy()
-                                params.update(fc.get('params', {}))
-                                pkt_obj = tpl['packet'](params)
-                            except Exception:
-                                try:
-                                    vm = self.controller._create_vm_for_random(fc.get('type'), fc.get('params', {}))
-                                    p_with_vm = dict(fc.get('params', {})); p_with_vm['vm'] = vm
-                                    pkt_obj = tpl['packet'](p_with_vm)
-                                except Exception:
-                                    pkt_obj = None
-                            pkt_builder = None
-                            if TREX_STL_AVAILABLE and isinstance(pkt_obj, STLPktBuilder):
-                                pkt_builder = pkt_obj
-                            elif TREX_STL_AVAILABLE and pkt_obj is not None:
-                                try:
-                                    pkt_builder = STLPktBuilder(pkt=pkt_obj)
-                                except Exception:
-                                    pkt_builder = None
-                            if pkt_builder is None:
-                                continue
-                            # assign PGID (reuse existing if present)
-                            pgid = fc.get('pgid') or ((port + 1) * 1000 + idx + 1)
-                            stream = STLStream(packet=pkt_builder, mode=STLTXCont(percentage=fc.get('params', {}).get('rate', 50.0)), flow_stats=STLFlowStats(pg_id=pgid))
-                            try:
-                                self.controller.client.add_streams(stream, ports=[port])
-                                fc['stream'] = stream
-                                fc['pgid'] = pgid
-                            except Exception:
-                                pass
-                except Exception as e:
-                    traceback.print_exc()
-                    self.append_status(f"重新下发流失败: {e}", "错误")
-
-            self.append_status(f"已保存对端口{port} 流索引{index}的修改", "信息")
-            self.editing = None
-            self.save_changes_btn.setEnabled(False)
-            # refresh list view
-            self.refresh_flow_list_for_port(port)
-        except Exception as e:
-            traceback.print_exc()
-            self.append_status(f"保存变更异常: {e}", "错误")
-
-    def on_start_flow(self, port: int, index: int):
-        try:
-            ok, msg = self.controller.start_flow(port, index)
-            if ok:
-                self.append_status(f"已启动端口{port} 流{index}", "信息")
-                # mark active and refresh
-                try:
-                    self.controller.flow_configs[port][index]['active'] = True
-                except Exception:
-                    pass
-            else:
-                self.append_status(f"启动失败: {msg}", "错误")
-            self.refresh_flow_list_for_port(port)
-        except Exception as e:
-            traceback.print_exc()
-            self.append_status(f"启动异常: {e}", "错误")
-
-    def on_stop_flow(self, port: int, index: int):
-        try:
-            ok, msg = self.controller.stop_flow(port, index)
-            if ok:
-                self.append_status(f"已停止端口{port} 流{index}", "信息")
-                try:
-                    self.controller.flow_configs[port][index]['active'] = False
-                except Exception:
-                    pass
-            else:
-                self.append_status(f"停止失败: {msg}", "错误")
-            self.refresh_flow_list_for_port(port)
-        except Exception as e:
-            traceback.print_exc()
-            self.append_status(f"停止异常: {e}", "错误")
-
-    def on_delete_flow(self, port: int, index: int):
-        try:
-            confirm = QMessageBox.question(self, "确认删除", f"确定要删除端口 {port} 的流索引 {index} 吗？", QMessageBox.Yes | QMessageBox.No)
-            if confirm != QMessageBox.Yes:
-                return
-            ok, msg = self.controller.remove_flow_from_port(port, index)
-            if ok:
-                self.append_status(f"已删除端口{port} 流{index}: {msg}", "信息")
-            else:
-                self.append_status(f"删除失败: {msg}", "错误")
-            # refresh
-            self.refresh_flow_list_for_port(port)
-        except Exception as e:
-            traceback.print_exc()
-            self.append_status(f"删除异常: {e}", "错误")
-
-    def update_ui_connected(self, connected: bool):
-        self.start_btn.setEnabled(connected)
-
