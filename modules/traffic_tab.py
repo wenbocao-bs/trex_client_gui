@@ -37,7 +37,7 @@ LAYER_PRESETS = {
     ],
     'L3': [
         {'id': 'ipv4', 'name': 'IPv4', 'template': "IP(src='{src_ip}', dst='{dst_ip}')"},
-        {'id': 'ipv6', 'name': 'IPv6', 'template': "IPv6(src='{src_ip}', dst='{dst_ip}')"},
+        {'id': 'ipv6', 'name': 'IPv6', 'template': "IPv6(src='{src_ipv6}', dst='{dst_ipv6}')"},
     ],
     'L4': [
         {'id': 'udp', 'name': 'UDP', 'template': "UDP(sport={src_port}, dport={dst_port})"},
@@ -200,6 +200,8 @@ class TrafficTab(QWidget):
             'dst_mac': self.dst_mac_le.text().strip(),
             'src_ip': self.src_ip_le.text().strip(),
             'dst_ip': self.dst_ip_le.text().strip(),
+            'src_ipv6': "FC00:0000:130F:0000:0000:09C0:876A:130B",
+            'dst_ipv6': "0000:0000:130F:0000:0000:09C0:876A:FFFF",
             'src_port': int(self.src_port_sb.value()),
             'dst_port': int(self.dst_port_sb.value()),
             'vlan_id': 100,
@@ -389,61 +391,71 @@ class TrafficTab(QWidget):
         seq_index: zero-based index used for inc/dec
         """
         mode = field_cfg.get('mode', 'fixed')
+        # 检测是否为IP地址字段
+        field_name = field_cfg.get('name', '')
+        is_ip_field = 'ip' in field_name.lower()
+        # 检测是否为IPv6地址
+        sample_value = field_cfg.get('value', field_cfg.get('start', ''))
+        is_ipv6 = ':' in str(sample_value) and is_ip_field
         if mode == 'fixed':
             return field_cfg.get('value', '')
-        if mode == 'random':
+        elif mode == 'random':
             start = field_cfg.get('start', '')
-            end = field_cfg.get('end', '')
-            # Try IP range (v4 or v6)
-            try:
-                if ':' in str(start) or ':' in str(end):
-                    s = self._ip_to_int(start); e = self._ip_to_int(end)
-                    if s > e:
-                        s, e = e, s
-                    val = random.randint(s, e)
-                    return self._int_to_ip(val, v6=True)
-                else:
-                    s = self._ip_to_int(start); e = self._ip_to_int(end)
-                    if s > e:
-                        s, e = e, s
-                    val = random.randint(s, e)
-                    return self._int_to_ip(val)
-            except Exception:
-                pass
-            # numeric fallback
-            try:
-                s = int(start); e = int(end)
-                if s > e:
-                    s, e = e, s
-                return str(random.randint(s, e))
-            except Exception:
-                # fallback to choose from comma separated list if provided
-                opts = (str(start) + ',' + str(end)).split(',')
-                opts = [x.strip() for x in opts if x.strip()]
-                if opts:
-                    return random.choice(opts)
-                return field_cfg.get('value', '')
-        if mode in ('inc', 'dec'):
+            end = field_cfg.get('end', '')   
+            if is_ip_field:
+                try:
+                    # IP地址随机处理
+                    start_int = self._safe_ip_to_int(start, is_ipv6)
+                    end_int = self._safe_ip_to_int(end, is_ipv6)
+                    
+                    if start_int > end_int:
+                        start_int, end_int = end_int, start_int
+                    
+                    # 生成随机IP地址
+                    rand_int = random.randint(start_int, end_int)
+                    return self._safe_int_to_ip(rand_int, is_ipv6)
+                    
+                except Exception as e:
+                    self.append_status(f"IP随机生成错误: {str(e)}", "警告")
+                    return field_cfg.get('value', '')
+            else:
+                # 非IP字段的随机处理
+                try:
+                    start_val = int(start) if start.strip() else 0
+                    end_val = int(end) if end.strip() else 65535
+                    if start_val > end_val:
+                        start_val, end_val = end_val, start_val
+                    return str(random.randint(start_val, end_val))
+                except ValueError:
+                    # 如果无法转换为数字，从选项中随机选择
+                    options = [start, end]
+                    valid_options = [opt for opt in options if opt.strip()]
+                    return random.choice(valid_options) if valid_options else field_cfg.get('value', '')
+        elif mode in ('inc', 'dec'):
             # base is start (or value), step default field_cfg.step
             try:
-                base_s = field_cfg.get('start', field_cfg.get('value', ''))
+                base_str = field_cfg.get('start', field_cfg.get('value', ''))
                 step = int(field_cfg.get('step', 1))
-                # IP sequence (supports v4/v6)
-                if ':' in str(base_s):
-                    base = self._ip_to_int(base_s)
+
+                if is_ip_field:
+                    base_int = self._safe_ip_to_int(base_str, is_ipv6)
+
                     if mode == 'inc':
-                        val = base + seq_index * step
-                    else:
-                        val = base - seq_index * step
-                    return self._int_to_ip(val, v6=True)
+                        result_int = base_int + seq_index * step
+                    else:  # dec
+                        result_int = base_int - seq_index * step
+
+                    return self._safe_int_to_ip(result_int, is_ipv6)
                 else:
-                    base = int(base_s)
+                    base_val = int(base_str) if base_str.strip() else 0
                     if mode == 'inc':
-                        val = base + seq_index * step
-                    else:
-                        val = base - seq_index * step
-                    return str(val)
-            except Exception:
+                        result_val = base_val + seq_index * step
+                    else:  # dec
+                        result_val = base_val - seq_index * step
+                    return str(result_val)
+
+            except Exception as e:
+                self.append_status(f"递增/递减模式错误: {str(e)}", "警告")
                 return field_cfg.get('value', '')
         # fallback
         return field_cfg.get('value', '')
@@ -487,7 +499,144 @@ class TrafficTab(QWidget):
                 return expr, None
         else:
             return expr, None
+    def _safe_ip_to_int(self, ip_str, is_ipv6=False):
+        """安全地将IP地址转换为整数，处理IPv6大整数问题"""
+        try:
+            if is_ipv6:
+                # 对于IPv6，使用更安全的大整数处理
+                ip_obj = ipaddress.IPv6Address(ip_str)
+                # 将IPv6地址转换为128位整数
+                ip_int = int(ip_obj)
+                # 确保返回的是正数
+                return ip_int if ip_int >= 0 else (1 << 128) + ip_int
+            else:
+                # IPv4直接转换
+                return int(ipaddress.IPv4Address(ip_str))
+        except (ipaddress.AddressValueError, ValueError) as e:
+            self.append_status(f"IP地址转换错误: {ip_str} - {str(e)}", "错误")
+            # 返回默认值
+            if is_ipv6:
+                return int(ipaddress.IPv6Address("::1"))
+            else:
+                return int(ipaddress.IPv4Address("127.0.0.1"))
 
+    def _safe_int_to_ip(self, ip_int, is_ipv6=False):
+        """安全地将整数转换回IP地址"""
+        try:
+            if is_ipv6:
+                # 处理IPv6大整数
+                if ip_int < 0:
+                    ip_int = (1 << 128) + ip_int
+                elif ip_int >= (1 << 128):
+                    ip_int = ip_int % (1 << 128)  # 取模防止溢出
+                return str(ipaddress.IPv6Address(ip_int))
+            else:
+                # IPv4处理
+                if ip_int < 0:
+                    ip_int = (1 << 32) + ip_int
+                elif ip_int >= (1 << 32):
+                    ip_int = ip_int % (1 << 32)  # 取模防止溢出
+                return str(ipaddress.IPv4Address(ip_int))
+        except Exception as e:
+            self.append_status(f"整数转IP错误: {ip_int} - {str(e)}", "错误")
+            # 返回默认值
+            if is_ipv6:
+                return "::1"
+            else:
+                return "127.0.0.1"
+
+    def ipv4_to_ipv6(self, ipv4_address, conversion_type="ipv4_mapped"):
+        """
+        将IPv4地址转换为IPv6地址
+
+        Args:
+            ipv4_address: IPv4地址字符串
+            conversion_type: 转换类型
+                - "ipv4_mapped": IPv4映射地址 (::ffff:192.0.2.1)
+                - "ipv4_compatible": IPv4兼容地址 (::192.0.2.1) - 已弃用
+                - "6to4": 6to4地址 (2002:c000:0201::)
+                - "teredo": Teredo地址 (2001:0000:4136:e378:8000:63bf:3fff:fdd2)
+                - "siit": SIIT转换 (默认使用映射地址)
+
+        Returns:
+            IPv6地址字符串
+        """
+        try:
+            ipv4_obj = ipaddress.IPv4Address(ipv4_address)
+            ipv4_int = int(ipv4_obj)
+
+            if conversion_type == "ipv4_mapped":
+                # ::ffff:192.0.2.1 格式
+                ipv6_int = (0xFFFF << 32) | ipv4_int
+                return f"::ffff:{ipv4_address}"
+
+            elif conversion_type == "ipv4_compatible":
+                # ::192.0.2.1 格式 (已弃用)
+                return f"::{ipv4_address}"
+
+            elif conversion_type == "6to4":
+                # 2002:c000:0201:: 格式
+                # 2002:IPv4地址::/48
+                hex_part = format(ipv4_int, '08x')
+                return f"2002:{hex_part[0:4]}:{hex_part[4:8]}::"
+
+            elif conversion_type == "teredo":
+                # Teredo地址格式 (简化版)
+                # 实际Teredo更复杂，这里提供基本格式
+                teredo_prefix = 0x20010000
+                teredo_addr = (teredo_prefix << 32) | ipv4_int
+                ipv6_obj = ipaddress.IPv6Address(teredo_addr)
+                return str(ipv6_obj)
+
+            elif conversion_type == "siit":
+                # SIIT使用映射地址
+                ipv6_int = (0xFFFF << 32) | ipv4_int
+                ipv6_obj = ipaddress.IPv6Address(ipv6_int)
+                return str(ipv6_obj)
+
+            else:
+                # 默认使用映射地址
+                return f"::ffff:{ipv4_address}"
+
+        except Exception as e:
+            self.append_status(f"IPv4转IPv6错误: {str(e)}", "错误")
+            return "::1"  # 返回默认IPv6地址
+
+    def ipv6_to_ipv4(self, ipv6_address):
+        """
+        从IPv6地址提取IPv4地址（反向转换）
+        支持映射地址、兼容地址和6to4地址
+
+        Args:
+            ipv6_address: IPv6地址字符串
+
+        Returns:
+            IPv4地址字符串或None（如果不是IPv4转换地址）
+        """
+        try:
+            ipv6_obj = ipaddress.IPv6Address(ipv6_address)
+            ipv6_int = int(ipv6_obj)
+
+            # 检查IPv4映射地址 ::ffff:192.0.2.1
+            if (ipv6_int >> 32) == 0xFFFF:
+                ipv4_int = ipv6_int & 0xFFFFFFFF
+                return str(ipaddress.IPv4Address(ipv4_int))
+
+            # 检查IPv4兼容地址 ::192.0.2.1 (已弃用)
+            if ipv6_int < (1 << 32):
+                return str(ipaddress.IPv4Address(ipv6_int))
+
+            # 检查6to4地址 2002:c000:0201::
+            if (ipv6_int >> 112) == 0x2002:
+                ipv4_int = (ipv6_int >> 80) & 0xFFFFFFFF
+                return str(ipaddress.IPv4Address(ipv4_int))
+
+            # 不是IPv4转换地址
+            return None
+
+        except Exception as e:
+            self.append_status(f"IPv6转IPv4错误: {str(e)}", "错误")
+            return None
     # ---------------- Create streams from composition (trex VM generation supporting IPv6) ----------------
     def create_streams_from_composition(self, params):
         """
@@ -504,7 +653,6 @@ class TrafficTab(QWidget):
 
         comp = params.get('composition', [])
         rate = float(params.get('rate', 10.0))
-        vlan_enabled = bool(params.get('vlan_enabled', False))
         flow_type = (params.get('flow_type') or '').upper()
 
         # helper: map field name to TREX pkt_offset
@@ -512,9 +660,13 @@ class TrafficTab(QWidget):
             f = fname.lower()
             # ip fields
             if 'src_ip' == f or f.endswith('_src_ip') or f in ('srcip','src_ip'):
-                return 'IPv6.src' if is_ipv6 else 'IP.src'
+                return 'IP.src'
             if 'dst_ip' == f or f.endswith('_dst_ip') or f in ('dstip','dst_ip','dst_ip'):
-                return 'IPv6.dst' if is_ipv6 else 'IP.dst'
+                return 'IP.dst'
+            if 'src_ipv6' == f or f.endswith('_src_ipv6') or f in ('srcipv6','src_ipv6'):
+                return 'IPv6.src'
+            if 'dst_ipv6' == f or f.endswith('_dst_ipv6') or f in ('dstipv6','dst_ipv6','dst_ipv6'):
+                return 'IPv6.dst'
             # port fields
             if 'src_port' == f or f == 'sport' or f.endswith('src_port'):
                 return f"{l4_proto}.sport"
@@ -536,54 +688,67 @@ class TrafficTab(QWidget):
 
         # Build a minimal scapy packet from composition for a given size (best-effort)
         def build_base_packet_for_size(sz=None):
-            if scapy_ok:
-                # build layers based on composition fixed values
-                eth_layer = None
-                l3_layer = None
-                l4_layer = None
-                payload = b''
-                for layer in comp:
-                    tpl = layer.get('template','')
-                    fields = layer.get('fields', {})
-                    # simple heuristics
-                    if 'Ether' in tpl or layer.get('preset_id','').lower() == 'eth':
-                        src = fields.get('src_mac',{}).get('value') or params.get('src_mac')
-                        dst = fields.get('dst_mac',{}).get('value') or params.get('dst_mac')
-                        eth_layer = scapy.Ether(src=src, dst=dst)
-                    if 'IPv6' in tpl or layer.get('preset_id','').lower() == 'ipv6':
-                        src = fields.get('src_ip',{}).get('value') or params.get('src_ip')
-                        dst = fields.get('dst_ip',{}).get('value') or params.get('dst_ip')
-                        l3_layer = scapy.IPv6(src=src, dst=dst)
-                    if 'IP(' in tpl or layer.get('preset_id','').lower() == 'ipv4':
-                        src = fields.get('src_ip',{}).get('value') or params.get('src_ip')
-                        dst = fields.get('dst_ip',{}).get('value') or params.get('dst_ip')
-                        l3_layer = scapy.IP(src=src, dst=dst)
-                    if 'UDP' in tpl or layer.get('preset_id','').lower() == 'udp':
-                        sport = int(fields.get('src_port',{}).get('value') or params.get('src_port') or 1025)
-                        dport = int(fields.get('dst_port',{}).get('value') or params.get('dst_port') or 80)
-                        l4_layer = scapy.UDP(sport=sport, dport=dport)
-                    if 'TCP' in tpl or layer.get('preset_id','').lower() == 'tcp':
-                        sport = int(fields.get('src_port',{}).get('value') or params.get('src_port') or 1025)
-                        dport = int(fields.get('dst_port',{}).get('value') or params.get('dst_port') or 80)
-                        l4_layer = scapy.TCP(sport=sport, dport=dport)
-                # default minimal
-                if eth_layer is None:
-                    eth_layer = scapy.Ether(src=params.get('src_mac','00:03:00:01:40:01'),
-                                            dst=params.get('dst_mac','00:02:00:03:04:02'))
-                if l3_layer is None:
-                    # fallback to IPv4 with base params
-                    l3_layer = scapy.IP(src=params.get('src_ip','16.0.0.1'),
-                                        dst=params.get('dst_ip','48.0.0.1'))
-                if l4_layer is None:
-                    l4_layer = scapy.UDP(sport=params.get('src_port',1025), dport=params.get('dst_port',80))
-                pkt = eth_layer / l3_layer / l4_layer
-                hdr_len = len(bytes(pkt))
-                if sz and sz > hdr_len:
-                    pkt = pkt / scapy.Raw(load=b'X' * (sz - hdr_len))
-                return pkt
-            else:
-                # fallback raw bytes
+            try:
+                if scapy_ok:
+                    # build layers based on composition fixed values
+                    payload = b''
+                    layers = []
+                    for layer in comp:
+                        tpl = layer.get('template','')
+                        fields = layer.get('fields', {})
+                        # simple heuristics
+                        if 'Ether' in tpl or layer.get('preset_id','').lower() == 'eth':
+                            src = fields.get('src_mac',{}).get('value') or params.get('src_mac')
+                            dst = fields.get('dst_mac',{}).get('value') or params.get('dst_mac')
+                            layers.append(scapy.Ether(src=src, dst=dst))
+                        elif 'Dot1Q' in tpl or layer.get('preset_id','').lower() == 'vlan':
+                            vlan_id = fields.get('vlan_id',{}).get('value') or params.get('vlan_id')
+                            vlan_prio = fields.get('vlan_prio',{}).get('value') or params.get('vlan_prio')
+                            layers.append(scapy.Dot1Q(vlan=vlan_id, prio=vlan_prio))
+                        elif 'IPv6' in tpl or layer.get('preset_id','').lower() == 'ipv6':
+                            src = fields.get('src_ipv6',{}).get('value') or params.get('src_ipv6')
+                            dst = fields.get('dst_ipv6',{}).get('value') or params.get('dst_ipv6')
+                            layers.append(scapy.IPv6(src=src, dst=dst))
+                        elif 'IP(' in tpl or layer.get('preset_id','').lower() == 'ipv4':
+                            src = fields.get('src_ip',{}).get('value') or params.get('src_ip')
+                            dst = fields.get('dst_ip',{}).get('value') or params.get('dst_ip')
+                            layers.append(scapy.IP(src=src, dst=dst))
+                        elif 'UDP' in tpl or layer.get('preset_id','').lower() == 'udp':
+                            sport = int(fields.get('src_port',{}).get('value') or params.get('src_port') or 1025)
+                            dport = int(fields.get('dst_port',{}).get('value') or params.get('dst_port') or 80)
+                            layers.append(scapy.UDP(sport=sport, dport=dport))
+                        elif 'TCP' in tpl or layer.get('preset_id','').lower() == 'tcp':
+                            sport = int(fields.get('src_port',{}).get('value') or params.get('src_port') or 1025)
+                            dport = int(fields.get('dst_port',{}).get('value') or params.get('dst_port') or 80)
+                            layers.append(scapy.TCP(sport=sport, dport=dport))
+                    if not layers:
+                        eth_layer = scapy.Ether(
+                            src=self.src_mac_le.text().strip() or '00:03:00:01:40:01',
+                            dst=self.dst_mac_le.text().strip() or '00:02:00:03:04:02'
+                        )
+                        ip_layer = scapy.IP(
+                            src=self.src_ip_le.text().strip() or '16.0.0.1',
+                            dst=self.dst_ip_le.text().strip() or '48.0.0.1'
+                        )
+                        udp_layer = scapy.UDP(
+                            sport=self.src_port_sb.value() or 1025,
+                            dport=self.dst_port_sb.value() or 80
+                        )
+                        layers = [eth_layer, ip_layer, udp_layer]
+                    pkt = layers[0]
+                    for layer in layers[1:]:
+                        pkt = pkt / layer
+                    current_size = len(bytes(pkt))
+                    if sz and sz > hdr_len:
+                        payload_size = sz - current_size
+                        pkt = pkt / scapy.Raw(load=b'X' * payload_size)
+
+                    return pkt
+            except Exception as e:
+                self.append_status(f"构建基础报文失败: {str(e)}", "错误")
+                traceback.print_exc()
                 return b'\x00' * (sz or 64)
+                
 
         # Prepare VM (trex) or descriptive vm_desc
         vm = None
@@ -608,53 +773,77 @@ class TrafficTab(QWidget):
             fields = layer.get('fields', {})
             for fname, fcfg in fields.items():
                 mode = fcfg.get('mode','fixed')
+                print(f"{fname}")
+                if mode == "fixed":
+                    continue
+                print("not continue")
                 start = fcfg.get('start', fcfg.get('value',''))
                 end = fcfg.get('end', start)
                 step = int(fcfg.get('step', 1) or 1)
-                # decide if IP v6
+                # decide if IPv6
                 is_ipv6 = False
-                if isinstance(start,str) and ':' in start:
-                    is_ipv6 = True
-                if isinstance(end,str) and ':' in end:
-                    is_ipv6 = True
+
+                if isinstance(start, str):
+                    # 检查是否是IP地址字段
+                    if any(ip_keyword in fname.lower() for ip_keyword in ['ip', 'address']):
+                        if ':' in start and start.count(':') >= 2:
+                            is_ipv6 = True
+                        # 尝试解析确认
+                        try:
+                            if ':' in start:
+                                ipaddress.IPv6Address(start)
+                                is_ipv6 = True
+                            else:
+                                ipaddress.IPv4Address(start)
+                                is_ipv6 = False
+                        except:
+                            pass
                 pkt_field = pkt_field_for(fname, l4_proto=l4_guess, is_ipv6=is_ipv6)
                 if not pkt_field:
                     continue
                 var_name = f"vm_{li}_{var_counter}_{fname}"
                 var_counter += 1
-
-                # IP handling
-                if 'ip' in fname.lower():
+                if is_ipv6 or 'ip' in fname.lower():
                     try:
-                        if is_ipv6:
-                            s_int = int(ipaddress.IPv6Address(start))
-                            e_int = int(ipaddress.IPv6Address(end))
-                        else:
-                            s_int = int(ipaddress.IPv4Address(start))
-                            e_int = int(ipaddress.IPv4Address(end))
-                    except Exception:
-                        s_int = e_int = None
-                    if trex_ok and s_int is not None and e_int is not None:
-                        op = 'inc'
-                        if mode == 'random':
-                            op = 'rand'
-                        if mode == 'dec':
-                            op = 'dec'
-                        try:
-                            vm.var(name=var_name, min_value=s_int, max_value=e_int, size=16 if is_ipv6 else 4, op=op)
-                            vm.write(fv_name=var_name, pkt_offset=pkt_field)
-                        except Exception:
-                            # version differences: try alternative param names
+                        s_int = self._safe_ip_to_int(start, is_ipv6)
+                        e_int = self._safe_ip_to_int(end, is_ipv6)
+                        
+                        if s_int > e_int:
+                            s_int, e_int = e_int, s_int
+                        
+                        if trex_ok:
+                            op = 'inc'
+                            if mode == 'random':
+                                op = 'rand'
+                            elif mode == 'dec':
+                                op = 'dec'
+                                
+                            size = 16 if is_ipv6 else 4
                             try:
-                                vm.var(var_name, s_int, e_int, 16 if is_ipv6 else 4, op)
+                                vm.var(
+                                    name=var_name, 
+                                    min_value=s_int, 
+                                    max_value=e_int, 
+                                    size=size, 
+                                    op=op,
+                                    step=step
+                                )
                                 vm.write(fv_name=var_name, pkt_offset=pkt_field)
-                            except Exception:
-                                vm_desc['vars'].append(('ip', var_name, start, end, mode, step, pkt_field))
-                                vm_desc['writes'].append((var_name, pkt_field))
-                    else:
-                        vm_desc['vars'].append(('ip', var_name, start, end, mode, step))
-                        vm_desc['writes'].append((var_name, pkt_field))
-
+                            except Exception as e:
+                                # 兼容旧版本API
+                                try:
+                                    vm.var(var_name, s_int, e_int, size, op, step=step)
+                                    vm.write(fv_name=var_name, pkt_offset=pkt_field)
+                                except Exception as e2:
+                                    self.append_status(f"VM变量创建失败: {str(e2)}", "错误")
+                                    vm_desc['vars'].append(('ip', var_name, start, end, mode, step, pkt_field))
+                                    vm_desc['writes'].append((var_name, pkt_field))
+                        else:
+                            vm_desc['vars'].append(('ip', var_name, start, end, mode, step))
+                            vm_desc['writes'].append((var_name, pkt_field))           
+                    except Exception as e:
+                        self.append_status(f"IP字段处理错误 {fname}: {str(e)}", "错误")
+                        continue
                 # port handling
                 elif 'port' in fname.lower():
                     try:
@@ -748,8 +937,12 @@ class TrafficTab(QWidget):
                     # prefer passing scapy.Packet (pkt_template) directly to STLPktBuilder when possible
                     if is_scapy_pkt:
                         try:
-                            pkt_builder = STLPktBuilder(pkt=pkt_template, vm=vm)
+                            if var_counter:
+                                pkt_builder = STLPktBuilder(pkt=pkt_template, vm=vm)
+                            else:
+                                pkt_builder = STLPktBuilder(pkt=pkt_template)
                         except Exception:
+                            traceback.print_exc()
                             # some STLPktBuilder versions may not accept scapy.Packet directly -> try bytes
                             try:
                                 pkt_builder = STLPktBuilder(pkt=bytes(pkt_template), vm=vm)
@@ -846,10 +1039,15 @@ class TrafficTab(QWidget):
                     except Exception:
                         pass
                     # attempt to add streams to trex client
-                    if getattr(self.controller, 'is_connected', False) and getattr(self.controller, 'client', None) is not None:
+                    if getattr(self.controller, 'is_connected', False):
+                    #and getattr(self.controller, 'client', None) is not None:
                         try:
-                            self.controller.client.add_streams(stream, ports=[port])
+                            print("is_connect")
+                            #self.controller.client.add_streams(stream, ports=[port])
+                            self.controller.start_traffic(streams=stream, ports=[port], rate_percent=100)
                         except Exception:
+                            print("is failed:")
+                            traceback.print_exc()
                             # some clients expect list
                             try:
                                 self.controller.client.add_streams([stream], ports=[port])

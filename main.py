@@ -32,14 +32,14 @@ class MainWindow(QMainWindow):
         self.log_tab = LogTab(parent=self)
         self.connection_tab = ConnectionTab(self.controller, parent=self)
         self.traffic_tab = TrafficTab(self.controller, parent=self)
-        self.rfc2544_tab = Rfc2544Tab(self.controller, parent=self)
+       # self.rfc2544_tab = Rfc2544Tab(self.controller, parent=self)
         self.stats_tab = StatsTab(self.controller, parent=self)
         self.capture_tab = CaptureTab(self.controller, parent=self)
 
         # add tabs
         self.tabs.addTab(self.connection_tab, "连接配置")
         self.tabs.addTab(self.traffic_tab, "流量配置")
-        self.tabs.addTab(self.rfc2544_tab, "RFC2544 测试")
+        #self.tabs.addTab(self.rfc2544_tab, "RFC2544 测试")
         self.tabs.addTab(self.stats_tab, "统计信息")
         self.tabs.addTab(self.capture_tab, "数据包抓取")
         self.tabs.addTab(self.log_tab, "日志信息")

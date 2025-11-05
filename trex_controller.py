@@ -8,6 +8,7 @@ from typing import List, Tuple, Dict, Any, Optional
 import random
 import os
 import sys
+import traceback
 
 # try import trex API; if not available, we'll set client to None and use mocks
 try:
@@ -80,15 +81,18 @@ class TrexController:
         if not self.is_connected or not self.client:
             return False, "未连接到T-Rex"
         try:
-            for p in ports:
-                self.client.add_streams(streams, ports=[p])
+            if streams is not None:
+                for p in ports:
+                    self.client.add_streams(streams, ports=[p])
             if duration and duration > 0:
                 self.client.start(ports=ports, mult=f"{rate_percent}%", duration=duration)
             else:
                 self.client.start(ports=ports, mult=f"{rate_percent}%")
+            print(f"ports={ports} rate_percent={rate_percent}")
             self.traffic_active = True
             return True, "流量已启动"
         except Exception as e:
+            traceback.print_exc()
             return False, f"启动失败: {e}"
 
     def stop_traffic(self) -> Tuple[bool, str]:
