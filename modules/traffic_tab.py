@@ -6,17 +6,19 @@ import random
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
     QGroupBox, QSpinBox, QLineEdit, QTextEdit, QListWidget,
-    QListWidgetItem, QTableWidget, QTableWidgetItem, QMessageBox
+    QListWidgetItem, QTableWidget, QTableWidgetItem, QMessageBox, QCheckBox
 )
 from PyQt5.QtCore import Qt
 import traceback
 import ipaddress
 import time
 import copy
+from helper import helper, packet_parser, stats_calculator
+from helper import format_bps, format_pps, format_bytes
 
 # Optional T-Rex STL imports
 try:
-    from trex.stl.api import STLStream, STLPktBuilder, STLTXCont, STLFlowStats, STLVM
+    from trex.stl.api import STLStream, STLPktBuilder, STLTXCont, STLFlowStats, STLVM, STLTXSingleBurst
     TREX_STL_AVAILABLE = True
 except Exception:
     STLStream = STLPktBuilder = STLTXCont = STLFlowStats = STLVM = None
@@ -47,6 +49,9 @@ LAYER_PRESETS = {
     'TUNNEL': [
         {'id': 'vxlan', 'name': 'VXLAN (placeholder)', 'template': "VXLAN(vni={vni})"},
         {'id': 'gre', 'name': 'GRE (placeholder)', 'template': "GRE()"},
+    ],
+    'Raw': [
+        {'id': 'raw', 'name': 'Raw', 'template': "Raw(load={raw_bin})"},
     ]
 }
 
@@ -60,15 +65,18 @@ def extract_placeholders(template: str):
 class TrafficTab(QWidget):
     """
     支持通过预设层组合构建报文，并为每个占位字段提供模式配置（fixed/inc/dec/random）。
+    新增支持：
+      - 报文长度配置（mode: fixed/inc/dec/random, fields: value/start/end/step）
+      - 速率配置: 百分比(rate_percent) 与 pps（优先使用 pps）
+      - 运行模式: continuous / burst (burst_count)
+      - 运行时长: run_duration（秒）
     composition is list of dict:
       {
         'family': 'L3',
         'preset_id': 'ipv4',
         'name': 'IPv4',
         'template': "IP(src='{src_ip}', dst='{dst_ip}')",
-        'fields': {
-            'src_ip': {'mode':'fixed','value':'1.2.3.4', 'start':'16.0.0.1','end':'16.0.0.1','step':1},
-        }
+        'fields': {...}
       }
     """
     def __init__(self, controller, parent=None):
@@ -85,7 +93,7 @@ class TrafficTab(QWidget):
         layout = QVBoxLayout()
         self.setLayout(layout)
 
-        # Flow browser area (new): choose port -> list flows (middle) -> edit/save/delete
+        # Flow browser area
         flows_box = QGroupBox("Flow 浏览 (选择端口查看/编辑该端口下的 flows)")
         fbl = QVBoxLayout(); flows_box.setLayout(fbl)
         port_row = QHBoxLayout()
@@ -97,25 +105,39 @@ class TrafficTab(QWidget):
         fbl.addLayout(port_row)
 
         mid_row = QHBoxLayout()
-        # flows list (middle)
         self.flows_list = QListWidget()
         self.flows_list.currentRowChanged.connect(self.on_flow_selected)
+        # 单击/双击 -> 编辑
+        self.flows_list.itemClicked.connect(self._on_flow_item_activated)
+        self.flows_list.itemDoubleClicked.connect(self._on_flow_item_activated)
         mid_row.addWidget(self.flows_list, 2)
 
-        # flow action buttons
         act_v = QVBoxLayout()
         self.edit_flow_btn = QPushButton("Edit (加载到层预设界面)"); self.edit_flow_btn.clicked.connect(self._on_edit_flow_clicked)
         self.save_flow_btn = QPushButton("Save Changes"); self.save_flow_btn.clicked.connect(self._on_save_flow_clicked)
         self.delete_flow_btn = QPushButton("Delete Flow"); self.delete_flow_btn.clicked.connect(self._on_delete_flow_clicked)
+        self.start_flow_btn = QPushButton("开始打流"); self.start_flow_btn.clicked.connect(self._on_start_flow_clicked)
+        self.start_flow_btn.setStyleSheet("QPushButton { background-color: #90EE90; }")
+        self.pause_flow_btn = QPushButton("暂停打流"); self.pause_flow_btn.clicked.connect(self._on_pause_flow_clicked)
+        self.pause_flow_btn.setStyleSheet("QPushButton { background-color: #FFB6C1; }")
+        self.stop_flow_btn = QPushButton("停止打流"); self.stop_flow_btn.clicked.connect(self._on_stop_flow_clicked)
+        self.stop_flow_btn.setStyleSheet("QPushButton { background-color: #FFA07A; }")
+
         act_v.addWidget(self.edit_flow_btn)
         act_v.addWidget(self.save_flow_btn)
         act_v.addWidget(self.delete_flow_btn)
+        act_v.addSpacing(10)
+        act_v.addWidget(QLabel("流量控制:"))
+        act_v.addWidget(self.start_flow_btn)
+        act_v.addWidget(self.pause_flow_btn)
+        act_v.addWidget(self.stop_flow_btn)
         act_v.addStretch()
         mid_row.addLayout(act_v, 1)
 
         fbl.addLayout(mid_row)
         layout.addWidget(flows_box)
 
+        # Basic fields
         base_row = QHBoxLayout()
         base_row.addWidget(QLabel("流名称:"))
         self.flow_name_le = QLineEdit(f"flow_{int(time.time())}")
@@ -149,7 +171,7 @@ class TrafficTab(QWidget):
         sel_row = QHBoxLayout()
         sel_row.addWidget(QLabel("层类型:"))
         self.family_cb = QComboBox()
-        self.family_cb.addItems(['L2','L3','L4','TUNNEL'])
+        self.family_cb.addItems(['L2','L3','L4','TUNNEL','Raw'])
         self.family_cb.currentTextChanged.connect(self._on_family_changed)
         sel_row.addWidget(self.family_cb)
         sel_row.addWidget(QLabel("预设:"))
@@ -176,12 +198,10 @@ class TrafficTab(QWidget):
 
         right_v = QVBoxLayout()
         right_v.addWidget(QLabel("Selected Layer Fields (mode: fixed/inc/dec/random)"))
-        # Table: Field | Mode | Value/Start | End | Step
         self.field_table = QTableWidget(0,5)
         self.field_table.setHorizontalHeaderLabels(['Field','Mode','Value/Start','End','Step'])
         self.field_table.horizontalHeader().setStretchLastSection(True)
         right_v.addWidget(self.field_table)
-        # Apply changes button
         self.apply_fields_btn = QPushButton("Apply Field Changes"); self.apply_fields_btn.clicked.connect(self.on_apply_field_changes)
         right_v.addWidget(self.apply_fields_btn)
         comp_row.addLayout(right_v)
@@ -193,14 +213,63 @@ class TrafficTab(QWidget):
 
         layout.addWidget(presets_box)
 
+        # Action row: targets + packet length / rate / run-mode / run-duration controls
         action_row = QHBoxLayout()
         action_row.addWidget(QLabel("目标端口 (逗号/范围):"))
         self.target_ports_le = QLineEdit("0")
         action_row.addWidget(self.target_ports_le)
+
+        # Packet length controls group
+        pktlen_group = QGroupBox("包长度")
+        pl_layout = QHBoxLayout(); pktlen_group.setLayout(pl_layout)
+        pl_layout.addWidget(QLabel("模式:"))
+        self.pktlen_mode_cb = QComboBox()
+        self.pktlen_mode_cb.addItems(FIELD_MODES)
+        self.pktlen_mode_cb.setCurrentText('fixed')
+        pl_layout.addWidget(self.pktlen_mode_cb)
+        pl_layout.addWidget(QLabel("值/起始:"))
+        self.pktlen_val_sb = QSpinBox(); self.pktlen_val_sb.setRange(1, 65535); self.pktlen_val_sb.setValue(64)
+        pl_layout.addWidget(self.pktlen_val_sb)
+        pl_layout.addWidget(QLabel("结束:"))
+        self.pktlen_end_sb = QSpinBox(); self.pktlen_end_sb.setRange(1, 65535); self.pktlen_end_sb.setValue(1500)
+        pl_layout.addWidget(self.pktlen_end_sb)
+        pl_layout.addWidget(QLabel("步长:"))
+        self.pktlen_step_sb = QSpinBox(); self.pktlen_step_sb.setRange(1, 65535); self.pktlen_step_sb.setValue(1)
+        pl_layout.addWidget(self.pktlen_step_sb)
+        action_row.addWidget(pktlen_group)
+
+        # Rate controls
+        rate_group = QGroupBox("速率")
+        rate_layout = QHBoxLayout(); rate_group.setLayout(rate_layout)
+        rate_layout.addWidget(QLabel("百分比:"))
+        self.rate_percent_sb = QSpinBox(); self.rate_percent_sb.setRange(1, 100); self.rate_percent_sb.setValue(10)
+        rate_layout.addWidget(self.rate_percent_sb)
+        rate_layout.addWidget(QLabel("PPS:"))
+        self.pps_sb = QSpinBox(); self.pps_sb.setRange(0, 10_000_000); self.pps_sb.setValue(0)  # 0 表示不使用
+        rate_layout.addWidget(self.pps_sb)
+        action_row.addWidget(rate_group)
+
+        # Run mode + run duration
+        run_group = QGroupBox("运行模式")
+        run_layout = QHBoxLayout(); run_group.setLayout(run_layout)
+        run_layout.addWidget(QLabel("模式:"))
+        self.run_mode_cb = QComboBox()
+        self.run_mode_cb.addItems(['continuous', 'burst'])
+        run_layout.addWidget(self.run_mode_cb)
+        run_layout.addWidget(QLabel("突发报文数:"))
+        self.burst_count_sb = QSpinBox(); self.burst_count_sb.setRange(1, 10_000_000); self.burst_count_sb.setValue(1000)
+        run_layout.addWidget(self.burst_count_sb)
+        run_layout.addWidget(QLabel("运行时长(s, 0=无限):"))
+        self.run_duration_sb = QSpinBox(); self.run_duration_sb.setRange(0, 24*3600); self.run_duration_sb.setValue(0)
+        run_layout.addWidget(self.run_duration_sb)
+        action_row.addWidget(run_group)
+
+        # Save / add buttons
         self.save_local_btn = QPushButton("仅保存本地配置"); self.save_local_btn.clicked.connect(self.on_save_local)
         action_row.addWidget(self.save_local_btn)
         self.add_to_device_btn = QPushButton("下发到 T-Rex 并保存"); self.add_to_device_btn.clicked.connect(self.on_add_to_device)
         action_row.addWidget(self.add_to_device_btn)
+
         layout.addLayout(action_row)
 
         self.status_te = QTextEdit(); self.status_te.setReadOnly(True); self.status_te.setMaximumHeight(140)
@@ -219,6 +288,31 @@ class TrafficTab(QWidget):
         for p in LAYER_PRESETS.get(family, []):
             self.preset_cb.addItem(p['name'], p)
 
+    # ---------------- small helpers to avoid int(None) errors ----------------
+    def _safe_int(self, v, default=0):
+        try:
+            if v is None:
+                return default
+            if isinstance(v, bool):
+                return int(v)
+            if isinstance(v, (int, float)):
+                return int(v)
+            s = str(v).strip()
+            if s == '':
+                return default
+            return int(s)
+        except Exception:
+            return default
+
+    def _safe_set_spin(self, spin: QSpinBox, v, default=None):
+        try:
+            if default is None:
+                default = spin.value()
+            spin.setValue(self._safe_int(v, default))
+        except Exception:
+            # ignore invalid set
+            pass
+
     # ---------------- Flow browser helpers ----------------
     def _on_load_flows_clicked(self):
         port = int(self.view_port_sb.value())
@@ -235,13 +329,20 @@ class TrafficTab(QWidget):
             flows_for_port = self.controller.flow_configs.get(port, [])
         except Exception:
             flows_for_port = []
-        print(flows_for_port)
         for idx, f in enumerate(flows_for_port):
-            idx = port
             name = f.get('name') or f.get('params', {}).get('name') or f"flow_{idx}"
-            item = QListWidgetItem(f"[{idx}] {name}")
+            active = f.get('active', False)
+            paused = f.get('paused', False)
+            status_text = "● 运行中" if active else "○ 已停止"
+            if paused:
+                status_text = "⏸ 已暂停"
+            # 显示运行时长（如果存在）
+            params = f.get('params', {}) or {}
+            run_duration = params.get('run_duration', None)
+            dur_text = f" / {run_duration}s" if run_duration else ""
+            item = QListWidgetItem(f"[{idx}] {name} - {status_text}{dur_text}")
             self.flows_list.addItem(item)
-        # Clear selection and UI so previous flow's config is not retained
+        # Clear selection and editor UI to avoid retention
         self._selected_flow_index = None
         self.composition = []
         self.composition_list.clear()
@@ -250,12 +351,7 @@ class TrafficTab(QWidget):
         self.append_status(f"Loaded {len(flows_for_port)} flows for port {port}")
 
     def on_flow_selected(self, idx: int):
-        """
-        When a flow entry in flows_list is selected, show its brief info in status.
-        Note: does NOT automatically load it for editing into the layer presets (user must click Edit),
-        but still clears previous UI to avoid retaining prior config.
-        """
-        # Clear UI preview of previous selection (to avoid retained data)
+        # Clear UI preview of previous selection to avoid retained data
         self.field_table.setRowCount(0)
         self.composition_list.clear()
         self.preview_te.clear()
@@ -272,7 +368,6 @@ class TrafficTab(QWidget):
                 return
             flow = flows[idx]
             self._selected_flow_index = idx
-            # Show a concise summary in status area
             name = flow.get('name') or flow.get('params', {}).get('name', '')
             params = flow.get('params', {})
             comp_len = len(params.get('composition', [])) if isinstance(params, dict) else 0
@@ -281,52 +376,106 @@ class TrafficTab(QWidget):
             traceback.print_exc()
             self.append_status(f"选择 flow 时出错: {e}", "错误")
 
+    def _on_flow_item_activated(self, item):
+        if item is None:
+            return
+        row = self.flows_list.row(item)
+        port = self._selected_port_for_view
+        if port is None:
+            port = int(self.view_port_sb.value())
+            self._selected_port_for_view = port
+            if self.flows_list.count() == 0:
+                self._refresh_flows_ui(port)
+        self._selected_flow_index = row
+        self._load_flow_into_editor(port, row)
+
+    def _load_flow_into_editor(self, port, idx):
+        """
+        加载 flow 到编辑器：对所有可能为 None 的字段做了 safe 转换，
+        并在 UI 上展示 run_duration（运行时长）。
+        """
+        try:
+            flows = self.controller.flow_configs.get(port, [])
+            if idx < 0 or idx >= len(flows):
+                return
+            flow = flows[idx]
+            params = flow.get('params', {}) or {}
+            # Clear editor
+            self.composition = []
+            self.composition_list.clear()
+            self.field_table.setRowCount(0)
+            # Load base fields
+            self.flow_name_le.setText(params.get('name', self.flow_name_le.text()))
+            if isinstance(params, dict):
+                if 'src_mac' in params and params.get('src_mac') is not None:
+                    self.src_mac_le.setText(str(params.get('src_mac')))
+                if 'dst_mac' in params and params.get('dst_mac') is not None:
+                    self.dst_mac_le.setText(str(params.get('dst_mac')))
+                if 'src_ip' in params and params.get('src_ip') is not None:
+                    self.src_ip_le.setText(str(params.get('src_ip')))
+                if 'dst_ip' in params and params.get('dst_ip') is not None:
+                    self.dst_ip_le.setText(str(params.get('dst_ip')))
+                # safe set spinboxes
+                self._safe_set_spin(self.src_port_sb, params.get('src_port'), self.src_port_sb.value())
+                self._safe_set_spin(self.dst_port_sb, params.get('dst_port'), self.dst_port_sb.value())
+                if 'target_ports' in params and params.get('target_ports') is not None:
+                    try:
+                        self.target_ports_le.setText(",".join([str(x) for x in params.get('target_ports', [])]))
+                    except Exception:
+                        pass
+                # load pkt len / rate / run mode / run duration if exist (use safe conversions)
+                pkt_len = params.get('pkt_len', {})
+                if pkt_len:
+                    mode = pkt_len.get('mode', 'fixed') or 'fixed'
+                    try:
+                        self.pktlen_mode_cb.setCurrentText(mode)
+                    except Exception:
+                        pass
+                    self._safe_set_spin(self.pktlen_val_sb, pkt_len.get('value'), self.pktlen_val_sb.value())
+                    self._safe_set_spin(self.pktlen_end_sb, pkt_len.get('end'), self.pktlen_end_sb.value())
+                    self._safe_set_spin(self.pktlen_step_sb, pkt_len.get('step'), self.pktlen_step_sb.value())
+                self._safe_set_spin(self.rate_percent_sb, params.get('rate_percent'), self.rate_percent_sb.value())
+                # pps may be None => set to 0 if None
+                pps_val = params.get('pps', None)
+                if pps_val is None:
+                    self.pps_sb.setValue(0)
+                else:
+                    self._safe_set_spin(self.pps_sb, pps_val, 0)
+                run_mode = params.get('run_mode', None)
+                if run_mode:
+                    try:
+                        self.run_mode_cb.setCurrentText(run_mode)
+                    except Exception:
+                        pass
+                if params.get('burst_count') is not None:
+                    self._safe_set_spin(self.burst_count_sb, params.get('burst_count'), self.burst_count_sb.value())
+                # run duration
+                if params.get('run_duration') is not None:
+                    self._safe_set_spin(self.run_duration_sb, params.get('run_duration'), self.run_duration_sb.value())
+                else:
+                    # keep existing value (default 0)
+                    pass
+            # Load composition deep-copied so editing doesn't immediately change stored flow until saved
+            comp = params.get('composition', []) if isinstance(params, dict) else []
+            self.composition = copy.deepcopy(comp)
+            # Populate composition_list UI
+            for layer in self.composition:
+                self.composition_list.addItem(QListWidgetItem(f"{layer.get('family')} - {layer.get('name')}"))
+            self.update_preview()
+            self.append_status(f"Loaded flow [{idx}] from port {port} into editor for editing.")
+        except Exception as e:
+            traceback.print_exc()
+            self.append_status(f"加载 flow 到编辑器出错: {e}", "错误")
+
     def _on_edit_flow_clicked(self):
-        """
-        Load the currently selected flow into the layer presets / composition UI for editing.
-        Replaces any existing composition in the editor (so previous flow config isn't retained).
-        """
         idx = self._selected_flow_index
         port = self._selected_port_for_view
         if port is None or idx is None:
             QMessageBox.information(self, "未选择", "请先在上方选择端口并选中一个 flow 再点击 Edit。")
             return
-        flows = self.controller.flow_configs.get(port, [])
-        if idx < 0 or idx >= len(flows):
-            QMessageBox.warning(self, "错误", "选中的 flow 索引无效。")
-            return
-        flow = flows[idx]
-        params = flow.get('params', {})
-        # Clear editor
-        self.composition = []
-        self.composition_list.clear()
-        self.field_table.setRowCount(0)
-        # Load base fields
-        self.flow_name_le.setText(params.get('name', self.flow_name_le.text()))
-        # base fields (if exist)
-        if isinstance(params, dict):
-            if 'src_mac' in params: self.src_mac_le.setText(params.get('src_mac', self.src_mac_le.text()))
-            if 'dst_mac' in params: self.dst_mac_le.setText(params.get('dst_mac', self.dst_mac_le.text()))
-            if 'src_ip' in params: self.src_ip_le.setText(params.get('src_ip', self.src_ip_le.text()))
-            if 'dst_ip' in params: self.dst_ip_le.setText(params.get('dst_ip', self.dst_ip_le.text()))
-            if 'src_port' in params: self.src_port_sb.setValue(int(params.get('src_port') or self.src_port_sb.value()))
-            if 'dst_port' in params: self.dst_port_sb.setValue(int(params.get('dst_port') or self.dst_port_sb.value()))
-            if 'target_ports' in params:
-                self.target_ports_le.setText(",".join([str(x) for x in params.get('target_ports', [])]))
-        # Load composition deep-copied so editing doesn't immediately change stored flow until saved
-        comp = params.get('composition', []) if isinstance(params, dict) else []
-        self.composition = copy.deepcopy(comp)
-        # Populate composition_list UI
-        for layer in self.composition:
-            self.composition_list.addItem(QListWidgetItem(f"{layer.get('family')} - {layer.get('name')}"))
-        self.update_preview()
-        self.append_status(f"Loaded flow [{idx}] into editor for editing.")
+        self._load_flow_into_editor(port, idx)
 
     def _on_save_flow_clicked(self):
-        """
-        Save current editor composition/params back into the selected flow (in controller.flow_configs),
-        and persist via controller API if available.
-        """
         idx = self._selected_flow_index
         port = self._selected_port_for_view
         if port is None or idx is None:
@@ -337,18 +486,14 @@ class TrafficTab(QWidget):
             QMessageBox.warning(self, "保存失败", err)
             self.append_status(err, "错误")
             return
-        # Ensure composition in params reflects current editor
         params['composition'] = copy.deepcopy(self.composition)
-        # Update controller storage
         try:
             flows = self.controller.flow_configs.setdefault(port, [])
             if idx < 0 or idx >= len(flows):
                 QMessageBox.warning(self, "保存失败", "选中的 flow 索引无效")
                 return
-            # update local copy
             flows[idx]['params'] = params
             flows[idx]['name'] = params.get('name', flows[idx].get('name'))
-            # attempt controller.update_flow_on_port if exists (preferred), else call add_flow_to_port to persist
             if hasattr(self.controller, 'update_flow_on_port'):
                 try:
                     ok, msg = self.controller.update_flow_on_port(port, idx, flows[idx])
@@ -359,7 +504,6 @@ class TrafficTab(QWidget):
                 except Exception as e:
                     traceback.print_exc()
                     self.append_status(f"调用 controller.update_flow_on_port 失败: {e}", "警告")
-                    # fallback: try add_flow_to_port (may create duplicates)
                     try:
                         ok, msg = self.controller.add_flow_to_port(port, flows[idx])
                         if ok:
@@ -370,8 +514,8 @@ class TrafficTab(QWidget):
                         traceback.print_exc()
                         self.append_status(f"保存到控制器失败: {e2}", "错误")
             else:
-                # fallback
                 try:
+                    print("no_update_flow_port")
                     ok, msg = self.controller.add_flow_to_port(port, flows[idx])
                     if ok:
                         self.append_status(f"已保存端口 {port} flow [{idx}] (add_flow_to_port: {msg})", "信息")
@@ -380,7 +524,6 @@ class TrafficTab(QWidget):
                 except Exception as e:
                     traceback.print_exc()
                     self.append_status(f"调用 controller.add_flow_to_port 失败: {e}", "错误")
-            # refresh list UI to reflect new name
             self._refresh_flows_ui(port)
         except Exception as e:
             traceback.print_exc()
@@ -397,7 +540,6 @@ class TrafficTab(QWidget):
             if idx < 0 or idx >= len(flows):
                 QMessageBox.warning(self, "删除失败", "选中的 flow 索引无效。")
                 return
-            # try controller API first
             if hasattr(self.controller, 'remove_flow_from_port'):
                 try:
                     ok, msg = self.controller.remove_flow_from_port(port, idx)
@@ -408,7 +550,6 @@ class TrafficTab(QWidget):
                 except Exception as e:
                     traceback.print_exc()
                     self.append_status(f"调用 remove_flow_from_port 失败: {e}", "警告")
-            # remove locally
             try:
                 flows.pop(idx)
             except Exception:
@@ -423,6 +564,213 @@ class TrafficTab(QWidget):
             traceback.print_exc()
             self.append_status(f"删除 flow 出错: {e}", "错误")
 
+    # ---------------- Flow control methods ----------------
+    def _on_start_flow_clicked(self):
+        """开始打流"""
+        idx = self._selected_flow_index
+        port = self._selected_port_for_view
+        if port is None or idx is None:
+            QMessageBox.information(self, "未选择", "请先选择端口和flow")
+            return
+
+        try:
+            flows = self.controller.flow_configs.get(port, [])
+            if idx < 0 or idx >= len(flows):
+                QMessageBox.warning(self, "错误", "选中的flow索引无效")
+                return
+
+            flow = flows[idx]
+            flow_name = flow.get('name', f"flow_{idx}")
+
+            if not getattr(self.controller, 'is_connected', False):
+                QMessageBox.warning(self, "连接错误", "T-Rex未连接，请先连接T-Rex设备")
+                return
+
+            params = flow.get('params', {})
+            # Ensure safe retrieval
+            pps = params.get('pps', None)
+            rate_percent = params.get('rate_percent', None)
+            run_mode = params.get('run_mode', 'continuous')
+            burst_count = params.get('burst_count', None)
+            run_duration = params.get('run_duration', None)
+
+            # If pps is set, do NOT pass percentage to controller (pps takes precedence)
+            if pps:
+                pps = helper.format_pps(pps)
+                rate_to_pass = None
+            else:
+                rate_to_pass = rate_percent
+
+            # create streams (they contain enough meta for controller if needed)
+            streams, err = self.create_streams_from_composition(params)
+            if err and not streams:
+                QMessageBox.warning(self, "流生成失败", f"无法生成流数据: {err}")
+                return
+
+            try:
+                if hasattr(self.controller, 'start_traffic'):
+                    success, message, stream_id_list = self.controller.start_traffic(
+                        streams=streams,
+                        ports=[port],
+                        rate_percent=rate_to_pass,
+                        pps=None,
+                        duration=run_duration
+                    )
+                    if success:
+                        flow['active'] = True
+                        flow['paused'] = False
+                        flow['stream_id_list'] = stream_id_list
+                        self.append_status(f"开始打流成功: {flow_name} (端口 {port})", "成功")
+                        self._update_flow_status_display(port, idx, True)
+                    else:
+                        QMessageBox.warning(self, "打流失败", f"开始打流失败: {message}")
+                        self.append_status(f"开始打流失败: {message}", "错误")
+                else:
+                    # fallback: best-effort via controller.client
+                    if hasattr(self.controller, 'client') and self.controller.client:
+                        try:
+                            # If controller.client supports starting with total_pkts or pps, prefer that
+                            if run_mode == 'burst' and burst_count:
+                                try:
+                                    # some clients accept total_pkts kwarg
+                                    self.controller.client.start(ports=[port], total_pkts=burst_count)
+                                except TypeError:
+                                    self.controller.client.start(ports=[port], mult="1")
+                            else:
+                                # continuous: if pps specified, on some clients may be configured elsewhere
+                                self.controller.client.start(ports=[port], mult="1")
+                            flow['active'] = True
+                            flow['paused'] = False
+                            self.append_status(f"开始打流: {flow_name} (端口 {port})", "成功")
+                            self._update_flow_status_display(port, idx, True)
+                        except Exception:
+                            traceback.print_exc()
+                            QMessageBox.warning(self, "打流失败", "调用 T-Rex 客户端打流失败")
+                    else:
+                        QMessageBox.warning(self, "错误", "无法访问T-Rex客户端")
+            except Exception as e:
+                traceback.print_exc()
+                QMessageBox.warning(self, "异常", f"开始打流时发生异常: {str(e)}")
+                self.append_status(f"开始打流异常: {str(e)}", "错误")
+        except Exception as e:
+            traceback.print_exc()
+            QMessageBox.warning(self, "错误", f"开始打流失败: {str(e)}")
+            self.append_status(f"开始打流失败: {str(e)}", "错误")
+
+    def _on_pause_flow_clicked(self):
+        """暂停打流"""
+        idx = self._selected_flow_index
+        port = self._selected_port_for_view
+        if port is None or idx is None:
+            QMessageBox.information(self, "未选择", "请先选择端口和flow")
+            return
+
+        try:
+            flows = self.controller.flow_configs.get(port, [])
+            if idx < 0 or idx >= len(flows):
+                QMessageBox.warning(self, "错误", "选中的flow索引无效")
+                return
+
+            flow = flows[idx]
+            flow_name = flow.get('name', f"flow_{idx}")
+
+            if not flow.get('active', False):
+                QMessageBox.information(self, "提示", f"流 {flow_name} 未在运行状态")
+                return
+
+            if hasattr(self.controller, 'pause_traffic'):
+                success, message = self.controller.pause_traffic(ports=[port])
+                if success:
+                    flow['paused'] = True
+                    self.append_status(f"暂停打流: {flow_name} (端口 {port})", "信息")
+                    self._update_flow_status_display(port, idx, True, True)
+                else:
+                    QMessageBox.warning(self, "暂停失败", f"暂停打流失败: {message}")
+            else:
+                if hasattr(self.controller, 'client') and self.controller.client:
+                    try:
+                        self.controller.client.pause(ports=[port])
+                        flow['paused'] = True
+                        self.append_status(f"暂停打流: {flow_name} (端口 {port})", "信息")
+                        self._update_flow_status_display(port, idx, True, True)
+                    except Exception:
+                        traceback.print_exc()
+                        QMessageBox.warning(self, "暂停失败", "调用客户端 pause 失败")
+                else:
+                    QMessageBox.warning(self, "错误", "无法访问T-Rex客户端")
+        except Exception as e:
+            traceback.print_exc()
+            QMessageBox.warning(self, "错误", f"暂停打流失败: {str(e)}")
+            self.append_status(f"暂停打流失败: {str(e)}", "错误")
+
+    def _on_stop_flow_clicked(self):
+        """停止打流"""
+        idx = self._selected_flow_index
+        port = self._selected_port_for_view
+        if port is None or idx is None:
+            QMessageBox.information(self, "未选择", "请先选择端口和flow")
+            return
+
+        try:
+            flows = self.controller.flow_configs.get(port, [])
+            if idx < 0 or idx >= len(flows):
+                QMessageBox.warning(self, "错误", "选中的flow索引无效")
+                return
+
+            flow = flows[idx]
+            flow_name = flow.get('name', f"flow_{idx}")
+
+            if hasattr(self.controller, 'stop_traffic'):
+                success, message = self.controller.stop_traffic(ports=port)
+                if success:
+                    flow['active'] = False
+                    flow['paused'] = False
+                    self.append_status(f"停止打流: {flow_name} (端口 {port})", "信息")
+                    self._update_flow_status_display(port, idx, False)
+                else:
+                    QMessageBox.warning(self, "停止失败", f"停止打流失败: {message}")
+            else:
+                if hasattr(self.controller, 'client') and self.controller.client:
+                    try:
+                        self.controller.client.stop(ports=[port])
+                        flow['active'] = False
+                        flow['paused'] = False
+                        self.append_status(f"停止打流: {flow_name} (端口 {port})", "信息")
+                        self._update_flow_status_display(port, idx, False)
+                    except Exception:
+                        traceback.print_exc()
+                        QMessageBox.warning(self, "停止失败", "调用客户端 stop 失败")
+                else:
+                    QMessageBox.warning(self, "错误", "无法访问T-Rex客户端")
+        except Exception as e:
+            traceback.print_exc()
+            QMessageBox.warning(self, "错误", f"停止打流失败: {str(e)}")
+            self.append_status(f"停止打流失败: {str(e)}", "错误")
+
+    def _update_flow_status_display(self, port: int, flow_index: int, active: bool, paused: bool = False):
+        """更新flow列表中的状态显示"""
+        try:
+            current_row = self.flows_list.currentRow()
+            flows = self.controller.flow_configs.get(port, [])
+            if 0 <= flow_index < len(flows):
+                flow = flows[flow_index]
+                name = flow.get('name', f"flow_{flow_index}")
+                status_text = "● 运行中" if active else "○ 已停止"
+                if paused:
+                    status_text = "⏸ 已暂停"
+                params = flow.get('params', {}) or {}
+                run_duration = params.get('run_duration', None)
+                dur_text = f" / {run_duration}s" if run_duration else ""
+                item_text = f"[{flow_index}] {name} - {status_text}{dur_text}"
+                if flow_index < self.flows_list.count():
+                    item = self.flows_list.item(flow_index)
+                    if item:
+                        item.setText(item_text)
+                if current_row >= 0:
+                    self.flows_list.setCurrentRow(current_row)
+        except Exception as e:
+            self.append_status(f"更新状态显示失败: {str(e)}", "警告")
+
     # ---------------- Composition operations ----------------
     def on_add_layer(self):
         preset = self.preset_cb.currentData()
@@ -430,10 +778,8 @@ class TrafficTab(QWidget):
             QMessageBox.warning(self, "错误", "未选择预设")
             return
         template = preset['template']
-        # initial fields extracted from template placeholders
         placeholders = extract_placeholders(template)
         fields = {}
-        # default values taken from UI base fields where appropriate
         defaults = {
             'src_mac': self.src_mac_le.text().strip(),
             'dst_mac': self.dst_mac_le.text().strip(),
@@ -443,11 +789,11 @@ class TrafficTab(QWidget):
             'dst_ipv6': "0000:0000:130F:0000:0000:09C0:876A:FFFF",
             'src_port': int(self.src_port_sb.value()),
             'dst_port': int(self.dst_port_sb.value()),
+            'vni':, 10
             'vlan_id': 100,
             'vlan_prio': 0
         }
         for ph in placeholders:
-            # set default end to same as start/value to provide a sensible default
             fld = {'mode':'fixed', 'value':defaults.get(ph, ''), 'start':defaults.get(ph, ''), 'end':defaults.get(ph, ''), 'step':1}
             fields[ph] = fld
         layer = {
@@ -494,7 +840,6 @@ class TrafficTab(QWidget):
             return
         parts = []
         for layer in self.composition:
-            # create a shallow preview: replace placeholders using current 'value' if fixed, else show placeholder
             tpl = layer.get('template', '')
             vals = {}
             for k, v in layer.get('fields', {}).items():
@@ -518,22 +863,17 @@ class TrafficTab(QWidget):
         fields = layer.get('fields', {})
         self.field_table.setRowCount(len(fields))
         for r, (fname, fcfg) in enumerate(fields.items()):
-            # Field name
             it = QTableWidgetItem(fname)
             it.setFlags(Qt.ItemIsEnabled)
             self.field_table.setItem(r, 0, it)
-            # Mode combo
             mode_cb = QComboBox()
             mode_cb.addItems(FIELD_MODES)
             mode_cb.setCurrentText(fcfg.get('mode', 'fixed'))
             self.field_table.setCellWidget(r, 1, mode_cb)
-            # Value/Start
             val_it = QTableWidgetItem(str(fcfg.get('value', '')))
             self.field_table.setItem(r, 2, val_it)
-            # End
             end_it = QTableWidgetItem(str(fcfg.get('end', '')))
             self.field_table.setItem(r, 3, end_it)
-            # Step
             step_it = QTableWidgetItem(str(fcfg.get('step', 1)))
             self.field_table.setItem(r, 4, step_it)
 
@@ -554,7 +894,6 @@ class TrafficTab(QWidget):
                 step = int(step_s)
             except Exception:
                 step = 1
-            # ensure start/end defaults remain sensible: if start empty use value; if end empty use start/value
             start_val = val if val else ''
             end_val = end if end else start_val
             new_fields[fname] = {'mode': mode, 'value': val, 'start': start_val, 'end': end_val, 'step': step}
@@ -574,6 +913,7 @@ class TrafficTab(QWidget):
             params['dst_ip'] = self.dst_ip_le.text().strip()
             params['src_port'] = int(self.src_port_sb.value())
             params['dst_port'] = int(self.dst_port_sb.value())
+
             ports_text = self.target_ports_le.text().strip()
             if not ports_text:
                 return None, "请填写目标端口"
@@ -597,14 +937,37 @@ class TrafficTab(QWidget):
             if not ports:
                 return None, "未解析到有效目标端口"
             params['target_ports'] = sorted(list(set(ports)))
-            # use current editor composition
+
+            # composition from editor
             params['composition'] = copy.deepcopy(self.composition)
+
+            # packet length params
+            pkt_len = {
+                'mode': self.pktlen_mode_cb.currentText(),
+                'value': int(self.pktlen_val_sb.value()),
+                'start': int(self.pktlen_val_sb.value()),
+                'end': int(self.pktlen_end_sb.value()),
+                'step': int(self.pktlen_step_sb.value())
+            }
+            params['pkt_len'] = pkt_len
+
+            # rate / pps
+            params['rate_percent'] = int(self.rate_percent_sb.value())
+            pps_val = int(self.pps_sb.value())
+            params['pps'] = pps_val if pps_val > 0 else None
+
+            # run mode / burst count / run duration
+            params['run_mode'] = self.run_mode_cb.currentText()
+            params['burst_count'] = int(self.burst_count_sb.value()) if params['run_mode'] == 'burst' else None
+            run_d = int(self.run_duration_sb.value())
+            params['run_duration'] = run_d if run_d > 0 else None
+
             return params, None
         except Exception as e:
             traceback.print_exc()
             return None, f"参数收集异常: {e}"
 
-    # ---------------- Field value resolution ----------------
+    # ---------------- Field value resolution & helpers ----------------
     def _is_ip(self, s: str):
         try:
             if ':' in str(s):
@@ -615,97 +978,100 @@ class TrafficTab(QWidget):
         except Exception:
             return False
 
-    def _ip_to_int(self, ip_s):
-        if ':' in str(ip_s):
-            return int(ipaddress.IPv6Address(ip_s))
-        return int(ipaddress.IPv4Address(ip_s))
+    def _safe_ip_to_int(self, ip_str, is_ipv6=False):
+        try:
+            if is_ipv6:
+                ip_obj = ipaddress.IPv6Address(ip_str)
+                ip_int = int(ip_obj)
+                return ip_int if ip_int >= 0 else (1 << 128) + ip_int
+            else:
+                return int(ipaddress.IPv4Address(ip_str))
+        except (ipaddress.AddressValueError, ValueError) as e:
+            self.append_status(f"IP地址转换错误: {ip_str} - {str(e)}", "错误")
+            if is_ipv6:
+                return int(ipaddress.IPv6Address("::1"))
+            else:
+                return int(ipaddress.IPv4Address("127.0.0.1"))
 
-    def _int_to_ip(self, i, v6=False):
-        if v6:
-            return str(ipaddress.IPv6Address(i))
-        return str(ipaddress.IPv4Address(i))
+    def _safe_int_to_ip(self, ip_int, is_ipv6=False):
+        try:
+            if is_ipv6:
+                if ip_int < 0:
+                    ip_int = (1 << 128) + ip_int
+                elif ip_int >= (1 << 128):
+                    ip_int = ip_int % (1 << 128)
+                return str(ipaddress.IPv6Address(ip_int))
+            else:
+                if ip_int < 0:
+                    ip_int = (1 << 32) + ip_int
+                elif ip_int >= (1 << 32):
+                    ip_int = ip_int % (1 << 32)
+                return str(ipaddress.IPv4Address(ip_int))
+        except Exception as e:
+            self.append_status(f"整数转IP错误: {ip_int} - {str(e)}", "错误")
+            if is_ipv6:
+                return "::1"
+            else:
+                return "127.0.0.1"
 
     def resolve_field_value(self, field_cfg: dict, seq_index: int):
-        """
-        field_cfg: {'mode','value','start','end','step'}
-        seq_index: zero-based index used for inc/dec
-        """
         mode = field_cfg.get('mode', 'fixed')
-        # 检测是否为IP地址字段
         field_name = field_cfg.get('name', '')
         is_ip_field = 'ip' in field_name.lower()
-        # 检测是否为IPv6地址
         sample_value = field_cfg.get('value', field_cfg.get('start', ''))
         is_ipv6 = ':' in str(sample_value) and is_ip_field
         if mode == 'fixed':
             return field_cfg.get('value', '')
         elif mode == 'random':
             start = field_cfg.get('start', '')
-            end = field_cfg.get('end', '')   
+            end = field_cfg.get('end', '')
             if is_ip_field:
                 try:
-                    # IP地址随机处理
                     start_int = self._safe_ip_to_int(start, is_ipv6)
                     end_int = self._safe_ip_to_int(end, is_ipv6)
-                    
                     if start_int > end_int:
                         start_int, end_int = end_int, start_int
-                    
-                    # 生成随机IP地址
                     rand_int = random.randint(start_int, end_int)
                     return self._safe_int_to_ip(rand_int, is_ipv6)
-                    
                 except Exception as e:
                     self.append_status(f"IP随机生成错误: {str(e)}", "警告")
                     return field_cfg.get('value', '')
             else:
-                # 非IP字段的随机处理
                 try:
-                    start_val = int(start) if start.strip() else 0
-                    end_val = int(end) if end.strip() else 65535
-                    if start_val > end_val:
-                        start_val, end_val = end_val, start_val
-                    return str(random.randint(start_val, end_val))
-                except ValueError:
-                    # 如果无法转换为数字，从选项中随机选择
+                    s = int(start) if str(start).strip() else 0
+                    e = int(end) if str(end).strip() else 65535
+                    if s > e:
+                        s, e = e, s
+                    return str(random.randint(s, e))
+                except Exception:
                     options = [start, end]
-                    valid_options = [opt for opt in options if opt.strip()]
+                    valid_options = [opt for opt in options if str(opt).strip()]
                     return random.choice(valid_options) if valid_options else field_cfg.get('value', '')
         elif mode in ('inc', 'dec'):
-            # base is start (or value), step default field_cfg.step
             try:
                 base_str = field_cfg.get('start', field_cfg.get('value', ''))
                 step = int(field_cfg.get('step', 1))
-
                 if is_ip_field:
                     base_int = self._safe_ip_to_int(base_str, is_ipv6)
-
                     if mode == 'inc':
                         result_int = base_int + seq_index * step
-                    else:  # dec
+                    else:
                         result_int = base_int - seq_index * step
-
                     return self._safe_int_to_ip(result_int, is_ipv6)
                 else:
-                    base_val = int(base_str) if base_str.strip() else 0
+                    base_val = int(base_str) if str(base_str).strip() else 0
                     if mode == 'inc':
                         result_val = base_val + seq_index * step
-                    else:  # dec
+                    else:
                         result_val = base_val - seq_index * step
                     return str(result_val)
-
             except Exception as e:
                 self.append_status(f"递增/递减模式错误: {str(e)}", "警告")
                 return field_cfg.get('value', '')
-        # fallback
         return field_cfg.get('value', '')
 
     # ---------------- Build packet from composition ----------------
     def build_packet_from_composition_for_index(self, composition, seq_index):
-        """
-        Build concrete expression for one sequence index (used when adding streams).
-        Returns composed expr (string) and, if possible, scapy.Packet object.
-        """
         parts = []
         for layer in composition:
             tpl = layer.get('template', '')
@@ -739,166 +1105,64 @@ class TrafficTab(QWidget):
                 return expr, None
         else:
             return expr, None
-    def _safe_ip_to_int(self, ip_str, is_ipv6=False):
-        """安全地将IP地址转换为整数，处理IPv6大整数问题"""
-        try:
-            if is_ipv6:
-                # 对于IPv6，使用更安全的大整数处理
-                ip_obj = ipaddress.IPv6Address(ip_str)
-                # 将IPv6地址转换为128位整数
-                ip_int = int(ip_obj)
-                # 确保返回的是正数
-                return ip_int if ip_int >= 0 else (1 << 128) + ip_int
-            else:
-                # IPv4直接转换
-                return int(ipaddress.IPv4Address(ip_str))
-        except (ipaddress.AddressValueError, ValueError) as e:
-            self.append_status(f"IP地址转换错误: {ip_str} - {str(e)}", "错误")
-            # 返回默认值
-            if is_ipv6:
-                return int(ipaddress.IPv6Address("::1"))
-            else:
-                return int(ipaddress.IPv4Address("127.0.0.1"))
 
-    def _safe_int_to_ip(self, ip_int, is_ipv6=False):
-        """安全地将整数转换回IP地址"""
-        try:
-            if is_ipv6:
-                # 处理IPv6大整数
-                if ip_int < 0:
-                    ip_int = (1 << 128) + ip_int
-                elif ip_int >= (1 << 128):
-                    ip_int = ip_int % (1 << 128)  # 取模防止溢出
-                return str(ipaddress.IPv6Address(ip_int))
-            else:
-                # IPv4处理
-                if ip_int < 0:
-                    ip_int = (1 << 32) + ip_int
-                elif ip_int >= (1 << 32):
-                    ip_int = ip_int % (1 << 32)  # 取模防止溢出
-                return str(ipaddress.IPv4Address(ip_int))
-        except Exception as e:
-            self.append_status(f"整数转IP错误: {ip_int} - {str(e)}", "错误")
-            # 返回默认值
-            if is_ipv6:
-                return "::1"
-            else:
-                return "127.0.0.1"
-
-    def ipv4_to_ipv6(self, ipv4_address, conversion_type="ipv4_mapped"):
+    def _compute_pkt_sizes_from_params(self, params):
         """
-        将IPv4地址转换为IPv6地址
-
-        Args:
-            ipv4_address: IPv4地址字符串
-            conversion_type: 转换类型
-                - "ipv4_mapped": IPv4映射地址 (::ffff:192.0.2.1)
-                - "ipv4_compatible": IPv4兼容地址 (::192.0.2.1) - 已弃用
-                - "6to4": 6to4地址 (2002:c000:0201::)
-                - "teredo": Teredo地址 (2001:0000:4136:e378:8000:63bf:3fff:fdd2)
-                - "siit": SIIT转换 (默认使用映射地址)
-
-        Returns:
-            IPv6地址字符串
+        根据 params['pkt_len'] 生成 sizes 列表用于 create_streams_from_composition。
+        支持 mode: fixed/inc/dec/random
         """
         try:
-            ipv4_obj = ipaddress.IPv4Address(ipv4_address)
-            ipv4_int = int(ipv4_obj)
+            cfg = params.get('pkt_len', {})
+            mode = cfg.get('mode', 'fixed')
+            start = int(cfg.get('start', cfg.get('value', 64) or 64))
+            end = int(cfg.get('end', start))
+            step = int(cfg.get('step', 1) or 1)
+            sizes = []
+            if mode == 'fixed':
+                sizes = [max(1, start)]
+            elif mode == 'inc':
+                if start <= end:
+                    sizes = list(range(start, end + 1, step))
+                else:
+                    sizes = list(range(start, end - 1, -step))
+            elif mode == 'dec':
+                if start >= end:
+                    sizes = list(range(start, end - 1, -step))
+                else:
+                    sizes = list(range(start, end + 1, step))
+            elif mode == 'random':
+                # generate a small set of random sizes to create multiple stream templates
+                samples = 5
+                lower = min(start, end)
+                upper = max(start, end) if end >= lower else lower
+                for _ in range(samples):
+                    sizes.append(random.randint(lower, upper))
+            # ensure at least one valid size
+            if not sizes:
+                sizes = [64]
+            # clip to MTU-like bounds
+            cleaned = [max(1, min(65535, int(x))) for x in sizes]
+            return cleaned
+        except Exception:
+            return [64]
 
-            if conversion_type == "ipv4_mapped":
-                # ::ffff:192.0.2.1 格式
-                ipv6_int = (0xFFFF << 32) | ipv4_int
-                return f"::ffff:{ipv4_address}"
-
-            elif conversion_type == "ipv4_compatible":
-                # ::192.0.2.1 格式 (已弃用)
-                return f"::{ipv4_address}"
-
-            elif conversion_type == "6to4":
-                # 2002:c000:0201:: 格式
-                # 2002:IPv4地址::/48
-                hex_part = format(ipv4_int, '08x')
-                return f"2002:{hex_part[0:4]}:{hex_part[4:8]}::"
-
-            elif conversion_type == "teredo":
-                # Teredo地址格式 (简化版)
-                # 实际Teredo更复杂，这里提供基本格式
-                teredo_prefix = 0x20010000
-                teredo_addr = (teredo_prefix << 32) | ipv4_int
-                ipv6_obj = ipaddress.IPv6Address(teredo_addr)
-                return str(ipv6_obj)
-
-            elif conversion_type == "siit":
-                # SIIT使用映射地址
-                ipv6_int = (0xFFFF << 32) | ipv4_int
-                ipv6_obj = ipaddress.IPv6Address(ipv6_int)
-                return str(ipv6_obj)
-
-            else:
-                # 默认使用映射地址
-                return f"::ffff:{ipv4_address}"
-
-        except Exception as e:
-            self.append_status(f"IPv4转IPv6错误: {str(e)}", "错误")
-            return "::1"  # 返回默认IPv6地址
-
-    def ipv6_to_ipv4(self, ipv6_address):
-        """
-        从IPv6地址提取IPv4地址（反向转换）
-        支持映射地址、兼容地址和6to4地址
-
-        Args:
-            ipv6_address: IPv6地址字符串
-
-        Returns:
-            IPv4地址字符串或None（如果不是IPv4转换地址）
-        """
-        try:
-            ipv6_obj = ipaddress.IPv6Address(ipv6_address)
-            ipv6_int = int(ipv6_obj)
-
-            # 检查IPv4映射地址 ::ffff:192.0.2.1
-            if (ipv6_int >> 32) == 0xFFFF:
-                ipv4_int = ipv6_int & 0xFFFFFFFF
-                return str(ipaddress.IPv4Address(ipv4_int))
-
-            # 检查IPv4兼容地址 ::192.0.2.1 (已弃用)
-            if ipv6_int < (1 << 32):
-                return str(ipaddress.IPv4Address(ipv6_int))
-
-            # 检查6to4地址 2002:c000:0201::
-            if (ipv6_int >> 112) == 0x2002:
-                ipv4_int = (ipv6_int >> 80) & 0xFFFFFFFF
-                return str(ipaddress.IPv4Address(ipv4_int))
-
-            # 不是IPv4转换地址
-            return None
-
-        except Exception as e:
-            self.append_status(f"IPv6转IPv4错误: {str(e)}", "错误")
-            return None
     # ---------------- Create streams from composition (trex VM generation supporting IPv6) ----------------
     def create_streams_from_composition(self, params):
-        """
-        根据 params['composition'] 动态生成 STLVM 指令并构建 STLPktBuilder/STLStream 列表。
-        返回 (streams, err)：
-          - 当 trex 可用且 streams 生成成功： ( [STLStream, ...], None )
-          - 当 trex 不可用或失败： ( [ (size, pkt_template, vm_desc), ... ], "trex not available or error" )
-        支持 IPv4/IPv6：对 IP 字段会判断是否含 ':' 来决定 IPv6 处理。
-        """
         import traceback, ipaddress
 
         trex_ok = TREX_STL_AVAILABLE
         scapy_ok = SCAPY_AVAILABLE
 
         comp = params.get('composition', [])
-        rate = float(params.get('rate', 10.0))
+        rate = float(params.get('rate_percent', 10.0) or 0)
+        pps = params.get('pps', None)
+        run_mode = params.get('run_mode', 'continuous')
+        burst_count = params.get('burst_count', None)
+        run_duration = params.get('run_duration', None)
         flow_type = (params.get('flow_type') or '').upper()
 
-        # helper: map field name to TREX pkt_offset
         def pkt_field_for(fname, l4_proto='UDP', is_ipv6=False):
             f = fname.lower()
-            # ip fields
             if 'src_ip' == f or f.endswith('_src_ip') or f in ('srcip','src_ip'):
                 return 'IP.src'
             if 'dst_ip' == f or f.endswith('_dst_ip') or f in ('dstip','dst_ip','dst_ip'):
@@ -907,36 +1171,30 @@ class TrafficTab(QWidget):
                 return 'IPv6.src'
             if 'dst_ipv6' == f or f.endswith('_dst_ipv6') or f in ('dstipv6','dst_ipv6','dst_ipv6'):
                 return 'IPv6.dst'
-            # port fields
             if 'src_port' == f or f == 'sport' or f.endswith('src_port'):
                 return f"{l4_proto}.sport"
             if 'dst_port' == f or f == 'dport' or f.endswith('dst_port'):
                 return f"{l4_proto}.dport"
-            # mac
             if 'src_mac' == f or f == 'smac':
                 return 'ETH.src'
             if 'dst_mac' == f or f == 'dmac':
                 return 'ETH.dst'
             if 'vlan' in f or 'vlan_id' == f:
                 return 'Dot1Q.vlan'
-            # fallback
             if 'ip' in f:
                 return 'IPv6.src' if is_ipv6 else 'IP.src'
             if 'port' in f:
                 return f"{l4_proto}.sport"
             return None
 
-        # Build a minimal scapy packet from composition for a given size (best-effort)
         def build_base_packet_for_size(sz=None):
             try:
                 if scapy_ok:
-                    # build layers based on composition fixed values
                     payload = b''
                     layers = []
                     for layer in comp:
                         tpl = layer.get('template','')
                         fields = layer.get('fields', {})
-                        # simple heuristics
                         if 'Ether' in tpl or layer.get('preset_id','').lower() == 'eth':
                             src = fields.get('src_mac',{}).get('value') or params.get('src_mac')
                             dst = fields.get('dst_mac',{}).get('value') or params.get('dst_mac')
@@ -978,17 +1236,16 @@ class TrafficTab(QWidget):
                     pkt = layers[0]
                     for layer in layers[1:]:
                         pkt = pkt / layer
-                    current_size = len(bytes(pkt))
-                    if sz and sz > hdr_len:
-                        payload_size = sz - current_size
-                        pkt = pkt / scapy.Raw(load=b'X' * payload_size)
-
+                    if sz:
+                        current_size = len(bytes(pkt))
+                        if sz > current_size:
+                            payload_size = sz - current_size
+                            pkt = pkt / scapy.Raw(load=b'X' * payload_size)
                     return pkt
             except Exception as e:
                 self.append_status(f"构建基础报文失败: {str(e)}", "错误")
                 traceback.print_exc()
                 return b'\x00' * (sz or 64)
-                
 
         # Prepare VM (trex) or descriptive vm_desc
         vm = None
@@ -997,7 +1254,7 @@ class TrafficTab(QWidget):
             vm = STLVM()
         var_counter = 0
 
-        # determine l4 proto guess from composition or params
+        # guess l4 proto
         l4_guess = (params.get('flow_type') or '').upper()
         if not l4_guess:
             for layer in comp:
@@ -1008,34 +1265,26 @@ class TrafficTab(QWidget):
         if not l4_guess:
             l4_guess = 'UDP'
 
-        # iterate composition and create VM entries
+        # VM vars for composition fields (same as before)
         for li, layer in enumerate(comp):
             fields = layer.get('fields', {})
             for fname, fcfg in fields.items():
                 mode = fcfg.get('mode','fixed')
-                print(f"{fname}")
                 if mode == "fixed":
                     continue
-                print("not continue")
                 start = fcfg.get('start', fcfg.get('value',''))
                 end = fcfg.get('end', start)
                 step = int(fcfg.get('step', 1) or 1)
-                # decide if IPv6
                 is_ipv6 = False
-
                 if isinstance(start, str):
-                    # 检查是否是IP地址字段
                     if any(ip_keyword in fname.lower() for ip_keyword in ['ip', 'address']):
                         if ':' in start and start.count(':') >= 2:
                             is_ipv6 = True
-                        # 尝试解析确认
                         try:
                             if ':' in start:
-                                ipaddress.IPv6Address(start)
-                                is_ipv6 = True
+                                ipaddress.IPv6Address(start); is_ipv6 = True
                             else:
-                                ipaddress.IPv4Address(start)
-                                is_ipv6 = False
+                                ipaddress.IPv4Address(start); is_ipv6 = False
                         except:
                             pass
                 pkt_field = pkt_field_for(fname, l4_proto=l4_guess, is_ipv6=is_ipv6)
@@ -1043,34 +1292,24 @@ class TrafficTab(QWidget):
                     continue
                 var_name = f"vm_{li}_{var_counter}_{fname}"
                 var_counter += 1
+                # similar handling as prior implementation
                 if is_ipv6 or 'ip' in fname.lower():
                     try:
                         s_int = self._safe_ip_to_int(start, is_ipv6)
                         e_int = self._safe_ip_to_int(end, is_ipv6)
-                        
                         if s_int > e_int:
                             s_int, e_int = e_int, s_int
-                        
                         if trex_ok:
                             op = 'inc'
                             if mode == 'random':
                                 op = 'rand'
                             elif mode == 'dec':
                                 op = 'dec'
-                                
                             size = 16 if is_ipv6 else 4
                             try:
-                                vm.var(
-                                    name=var_name, 
-                                    min_value=s_int, 
-                                    max_value=e_int, 
-                                    size=size, 
-                                    op=op,
-                                    step=step
-                                )
+                                vm.var(name=var_name, min_value=s_int, max_value=e_int, size=size, op=op, step=step)
                                 vm.write(fv_name=var_name, pkt_offset=pkt_field)
-                            except Exception as e:
-                                # 兼容旧版本API
+                            except Exception:
                                 try:
                                     vm.var(var_name, s_int, e_int, size, op, step=step)
                                     vm.write(fv_name=var_name, pkt_offset=pkt_field)
@@ -1080,11 +1319,9 @@ class TrafficTab(QWidget):
                                     vm_desc['writes'].append((var_name, pkt_field))
                         else:
                             vm_desc['vars'].append(('ip', var_name, start, end, mode, step))
-                            vm_desc['writes'].append((var_name, pkt_field))           
+                            vm_desc['writes'].append((var_name, pkt_field))
                     except Exception as e:
                         self.append_status(f"IP字段处理错误 {fname}: {str(e)}", "错误")
-                        continue
-                # port handling
                 elif 'port' in fname.lower():
                     try:
                         s_n = int(start); e_n = int(end)
@@ -1105,14 +1342,10 @@ class TrafficTab(QWidget):
                     else:
                         vm_desc['vars'].append(('port', var_name, start, end, mode, step))
                         vm_desc['writes'].append((var_name, pkt_field))
-
-                # mac handling
                 elif 'mac' in fname.lower():
-                    # TREX mac ranged vars are uncommon; handle fixed write or descriptive
                     val = fcfg.get('value','')
                     if trex_ok and val:
                         try:
-                            # try treat MAC as integer
                             mac_int = int(val.replace(':','').replace('-',''), 16)
                             vm.var(name=var_name, min_value=mac_int, max_value=mac_int, size=6, op='inc')
                             vm.write(fv_name=var_name, pkt_offset=pkt_field)
@@ -1136,22 +1369,8 @@ class TrafficTab(QWidget):
                 except Exception:
                     pass
 
-        # packet size handling: produce 1..N sizes
-        sizes = []
-        p0 = params.get('pkt_size_start', None)
-        p1 = params.get('pkt_size_end', None)
-        pst = int(params.get('pkt_size_step', 1) or 1)
-        if p0 is not None and p1 is not None:
-            try:
-                a = int(p0); b = int(p1)
-                if a <= b:
-                    sizes = list(range(a, b+1, pst))
-                else:
-                    sizes = list(range(b, a+1, pst))
-            except Exception:
-                sizes = []
-        if not sizes:
-            sizes = [None]
+        # packet size handling: use new pkt_len param support
+        sizes = self._compute_pkt_sizes_from_params(params)
 
         streams = []
         infos = []
@@ -1160,7 +1379,6 @@ class TrafficTab(QWidget):
             pkt_template = build_base_packet_for_size(sz)
             pkt_bytes = None
             if SCAPY_AVAILABLE and scapy is not None and pkt_template is not None:
-                # detect scapy packet by duck-typing: has 'build' or '__bytes__' or 'summary'
                 is_scapy_pkt = hasattr(pkt_template, 'summary') or hasattr(pkt_template, 'build') or hasattr(pkt_template, '__bytes__')
             else:
                 is_scapy_pkt = False
@@ -1169,12 +1387,10 @@ class TrafficTab(QWidget):
                 if isinstance(pkt_template, bytes):
                     pkt_bytes = pkt_template
                 else:
-                    # fallback raw bytes
                     pkt_bytes = b'\x00' * (sz or 64)
 
             if trex_ok:
                 try:
-                    # prefer passing scapy.Packet (pkt_template) directly to STLPktBuilder when possible
                     if is_scapy_pkt:
                         try:
                             if var_counter:
@@ -1183,15 +1399,37 @@ class TrafficTab(QWidget):
                                 pkt_builder = STLPktBuilder(pkt=pkt_template)
                         except Exception:
                             traceback.print_exc()
-                            # some STLPktBuilder versions may not accept scapy.Packet directly -> try bytes
                             try:
                                 pkt_builder = STLPktBuilder(pkt=bytes(pkt_template), vm=vm)
                             except Exception:
-                                # final fallback: create raw bytes packet
                                 pkt_builder = STLPktBuilder(pkt=bytes(pkt_template) if hasattr(pkt_template, '__bytes__') else (pkt_bytes or b'\x00'*(sz or 64)), vm=vm)
                     else:
                         pkt_builder = STLPktBuilder(pkt=pkt_bytes or b'\x00'*(sz or 64), vm=vm)
-                    stream = STLStream(packet=pkt_builder, mode=STLTXCont(percentage=rate))
+
+                    # choose TX mode: if pps provided prefer pps (and do not use percentage concurrently)
+                    tx_mode = None
+                    if burst_count:
+                        tx_mode = STLTXSingleBurst(total_pkts=burst_count, percentage=rate)
+                    else:
+                        if params.get('pps'):
+                            try:
+                                tx_mode = STLTXCont(pps=int(params.get('pps')))
+                            except Exception:
+                                tx_mode = STLTXCont(percentage=rate)
+                        else:
+                            tx_mode = STLTXCont(percentage=rate)
+
+                    stream = STLStream(packet=pkt_builder, mode=tx_mode)
+
+                    # attach metadata so controller.start_traffic (or other code) can respect run_mode/burst/run_duration
+                    stream._tx_meta = {
+                        'pps': params.get('pps'),
+                        'rate_percent': params.get('rate_percent'),
+                        'run_mode': run_mode,
+                        'burst_count': burst_count,
+                        'run_duration': run_duration
+                    }
+
                     streams.append(stream)
                 except Exception:
                     traceback.print_exc()
@@ -1204,43 +1442,72 @@ class TrafficTab(QWidget):
         else:
             return infos, "trex not available or streams generation failed"
 
-    # ---------------- Actions ----------------
+    # ---------------- Actions (save/add) ----------------
     def on_save_local(self):
         params, err = self._collect_params()
         if err:
             QMessageBox.warning(self, "保存失败", err)
             self.append_status(err, "错误")
             return
-        ports_text = self.target_ports_le.text().strip()
-        if not ports_text:
-            # 处理空输入
-            ports_list = [0]  # 默认端口
-        else:
-            # 如果输入的是单个端口号，直接使用
-            ports_text = int(ports_text)
-            ports_list = [ports_text]
-        for port in ports_list:
-            cfg = {
-                'name': params['name'],
-                'type': 'COMPOSED',
-                'params': params,
-                'tx_ports': [port],
-                'rx_ports': [port]
-            }
-            try:
-                if any(conf['name'] == cfg['name'] for conf in self.controller.flow_configs.get(port, [])):
-                    continue
-                ok, msg = self.controller.add_flow_to_port(port, cfg)
+
+        # Use active port (view_port_sb) as target for creation by default
+        try:
+            active_port = int(self.view_port_sb.value())
+        except Exception:
+            active_port = None
+
+        if active_port is None:
+            tps = params.get('target_ports', [])
+            if tps:
+                active_port = tps[0]
+                self.append_status(f"使用目标端口中的第一个端口 {active_port} 来创建 flow。", "警告")
+
+        if active_port is None:
+            QMessageBox.warning(self, "保存失败", "未指定要创建 flow 的端口（请选择查看端口或目标端口）。")
+            return
+
+        cfg = {
+            'name': params['name'],
+            'type': 'COMPOSED',
+            'params': params,
+            'tx_ports': [active_port],
+            'rx_ports': [active_port]
+        }
+        try:
+            # avoid duplicate by name on same port
+            existing = self.controller.flow_configs.get(active_port, [])
+            if any(conf.get('name') == cfg['name'] for conf in existing):
+                self.append_status(f"端口 {active_port} 上已存在同名流 {cfg['name']}，跳过保存。", "警告")
+            else:
+                ok, msg = self.controller.add_flow_to_port(active_port, cfg)
                 if ok:
-                    self.append_status(f"已保存本地流配置: 端口 {port} ({msg})", "信息")
+                   # try:
+                   #     self.controller.flow_configs.setdefault(active_port, []).append({
+                   #         'name': cfg['name'],
+                   #         'type': cfg['type'],
+                   #         'params': cfg['params'],
+                   #         'tx_ports': cfg['tx_ports'],
+                   #         'rx_ports': cfg['rx_ports'],
+                   #         'active': False,
+                   #         'paused': False
+                   #     })
+                   # except Exception:
+                   #     pass
+                    self.append_status(f"已保存本地流配置: 端口 {active_port} ({msg})", "信息")
                 else:
-                    self.append_status(f"保存本地流失败: 端口 {port} ({msg})", "错误")
-            except Exception as e:
-                traceback.print_exc()
-                self.append_status(f"调用控制器保存本地配置失败: {e}", "错误")
-        # refresh flows UI for the currently viewed port if applicable
-        if self._selected_port_for_view is not None:
-            self._refresh_flows_ui(self._selected_port_for_view)
+                    self.append_status(f"保存本地流失败: 端口 {active_port} ({msg})", "错误")
+        except Exception as e:
+            traceback.print_exc()
+            self.append_status(f"调用控制器保存本地配置失败: {e}", "错误")
+
+        # refresh flows UI
+        if active_port is not None:
+            try:
+                self.view_port_sb.setValue(active_port)
+            except Exception:
+                pass
+            self._selected_port_for_view = active_port
+            self._refresh_flows_ui(active_port)
 
     def on_add_to_device(self):
         params, err = self._collect_params()
@@ -1249,104 +1516,125 @@ class TrafficTab(QWidget):
             self.append_status(err, "错误")
             return
 
-        # For each target port, use current flow_configs length as sequence base
-        for port in params['target_ports']:
-            try:
-                if port not in self.controller.flow_configs:
-                    self.controller.flow_configs[port] = []
-                flow_index = len(self.controller.flow_configs[port])
-                # Build streams from composition (may return STLPktBuilder-wrapped streams or infos)
-                streams_or_infos, err2 = self.create_streams_from_composition(params)
-                if err2 is not None:
-                    # fallback: save local config (and show vm_desc)
-                    self.append_status("无法直接下发到 T-Rex（或生成 streams 失败），已保存本地配置。详情见 vm_desc。", "警告")
-                    # Save local config for port
-                    cfg = {
-                        'name': params['name'],
-                        'type': 'COMPOSED',
-                        'params': params,
-                        'tx_ports': [port],
-                        'rx_ports': [port],
-                        'vm_desc': streams_or_infos
-                    }
-                    #ok, msg = self.controller.add_flow_to_port(port, cfg)
-                    #if ok:
-                    #    # keep local cache
-                    #    try:
-                    #        self.controller.flow_configs.setdefault(port, []).append({
-                    #            'name': cfg['name'],
-                    #            'type': cfg['type'],
-                    #            'params': cfg['params'],
-                    #            'tx_ports': cfg['tx_ports'],
-                    #            'rx_ports': cfg['rx_ports'],
-                    #            'vm_desc': cfg.get('vm_desc'),
-                    #            'active': False
-                    #        })
-                    #    except Exception:
-                    #        pass
-                    #    self.append_status(f"已保存本地流配置(回退): 端口 {port} ({msg})", "信息")
-                    #else:
-                    #    self.append_status(f"保存本地流失败(回退): 端口 {port} ({msg})", "错误")
-                    #continue
+        # Use active port only (view_port_sb) to create flow
+        try:
+            active_port = int(self.view_port_sb.value())
+        except Exception:
+            tps = params.get('target_ports', [])
+            active_port = tps[0] if tps else None
+            if active_port is not None:
+                self.append_status(f"使用目标端口中的第一个端口 {active_port} 来下发 flow。", "警告")
 
-                # streams_or_infos is list of STLStream
-                for s_i, stream in enumerate(streams_or_infos):
-                    # create pgid deterministic from port + index
-                    base_pgid = (port + 1) * 1000
-                    pgid = base_pgid + flow_index + s_i + 1
-                    # attach flow stats with pg_id if possible
+        if active_port is None:
+            QMessageBox.warning(self, "错误", "没有可用的目标端口来下发流")
+            return
+
+        port = active_port
+        try:
+            if port not in self.controller.flow_configs:
+                self.controller.flow_configs[port] = []
+            flow_index = len(self.controller.flow_configs[port])
+            streams_or_infos, err2 = self.create_streams_from_composition(params)
+            if err2 is not None:
+                self.append_status("无法直接下发到 T-Rex（或生成 streams 失败），已保存本地配置。详情见 vm_desc。", "警告")
+                cfg = {
+                    'name': params['name'],
+                    'type': 'COMPOSED',
+                    'params': params,
+                    'tx_ports': [port],
+                    'rx_ports': [port],
+                    'vm_desc': streams_or_infos
+                }
+                ok, msg = self.controller.add_flow_to_port(port, cfg)
+                if ok:
+                   # try:
+                   #     self.controller.flow_configs.setdefault(port, []).append({
+                   #         'name': cfg['name'],
+                   #         'type': cfg['type'],
+                   #         'params': cfg['params'],
+                   #         'tx_ports': cfg['tx_ports'],
+                   #         'rx_ports': cfg['rx_ports'],
+                   #         'vm_desc': cfg.get('vm_desc'),
+                   #         'active': False,
+                   #         'paused': False
+                   #     })
+                   # except Exception:
+                   #     pass
+                    self.append_status(f"已保存本地流配置(回退): 端口 {port} ({msg})", "信息")
+                else:
+                    self.append_status(f"保存本地流失败(回退): 端口 {port} ({msg})", "错误")
+                return
+
+            # streams_or_infos is list of STLStream
+            for s_i, stream in enumerate(streams_or_infos):
+                base_pgid = (port + 1) * 1000
+                pgid = base_pgid + flow_index + s_i + 1
+                try:
+                    if hasattr(stream, 'flow_stats') and stream.flow_stats is not None:
+                        stream.flow_stats.pg_id = pgid
+                except Exception:
+                    pass
+                if getattr(self.controller, 'is_connected', False):
                     try:
-                        # wrap stream with updated flow_stats
-                        if hasattr(stream, 'flow_stats') and stream.flow_stats is not None:
-                            stream.flow_stats.pg_id = pgid
+                        # If pps specified, don't pass percentage simultaneously
+                        pps = params.get('pps', None)
+                        rate_percent = params.get('rate_percent', None)
+                        rate_to_pass = None if pps else rate_percent
+                        if pps:
+                            pps = helper.format_pps(pps)
+                        # Pass run parameters; controller.start_traffic should honor pps/run_mode/ burst_count / run_duration
+                        if hasattr(self.controller, 'start_traffic'):
+                            success, message = self.controller.start_traffic(
+                                streams=[stream],
+                                ports=[port],
+                                rate_percent=rate_to_pass,
+                                pps=pps,
+                                duration=params.get('run_duration')
+                            )
+                            if not success:
+                                self.append_status(f"下发并启动流警告: {message}", "警告")
                         else:
-                            # if stream has constructor-based flow_stats, re-create minimal wrapper
-                            pass
-                    except Exception:
-                        pass
-                    # attempt to add streams to trex client
-                    if getattr(self.controller, 'is_connected', False):
-                    #and getattr(self.controller, 'client', None) is not None:
-                        try:
-                            print("is_connect")
-                            #self.controller.client.add_streams(stream, ports=[port])
-                            self.controller.start_traffic(streams=stream, ports=[port], rate_percent=100)
-                        except Exception:
-                            print("is failed:")
-                            traceback.print_exc()
-                            # some clients expect list
+                            # fallback to client.add_streams (will not start automatically)
                             try:
                                 self.controller.client.add_streams([stream], ports=[port])
                             except Exception:
                                 traceback.print_exc()
-                                # fallback to saving local
                                 self.append_status("向 T-Rex 下发流时出错，已保存本地配置", "错误")
                                 self.on_save_local()
-                                continue
-                    # store metadata in controller.flow_configs
-                    #stored = {
-                    #    'name': params['name'],
-                    #    'type': 'COMPOSED',
-                    #    'params': params,
-                    #    'pgid': pgid,
-                    #    'stream': stream,
-                    #    'tx_ports': [port],
-                    #    'rx_ports': [port],
-                    #    'active': False
-                    #}
-                    #self.controller.flow_configs[port].append(stored)
-                    self.append_status(f"已下发流到 T-Rex (port={port}, pgid={pgid})", "信息")
+                                return
+                    except Exception:
+                        traceback.print_exc()
+                        try:
+                            self.controller.client.add_streams([stream], ports=[port])
+                        except Exception:
+                            traceback.print_exc()
+                            self.append_status("向 T-Rex 下发流时出错，已保存本地配置", "错误")
+                            self.on_save_local()
+                            return
+                # store metadata
+                stored = {
+                    'name': params['name'],
+                    'type': 'COMPOSED',
+                    'params': params,
+                    'pgid': pgid,
+                    'stream': stream,
+                    'tx_ports': [port],
+                    'rx_ports': [port],
+                    'active': False,
+                    'paused': False
+                }
+                self.controller.flow_configs[port].append(stored)
+                self.append_status(f"已下发流到 T-Rex (port={port}, pgid={pgid})", "信息")
+        except Exception as e:
+            traceback.print_exc()
+            self.append_status(f"端口 {port} 下发失败: {e}", "错误")
+            QMessageBox.warning(self, "下发失败", f"端口 {port} 下发失败: {e}")
 
-            except Exception as e:
-                traceback.print_exc()
-                self.append_status(f"端口 {port} 下发失败: {e}", "错误")
-                QMessageBox.warning(self, "下发失败", f"端口 {port} 下发失败: {e}")
-        # refresh flows UI for currently viewed port
+        # refresh flows UI
         if self._selected_port_for_view is not None:
             self._refresh_flows_ui(self._selected_port_for_view)
 
     def refresh_flow_list_for_port(self, port: int):
-        # placeholder for compatibility
         try:
             self.view_port_sb.setValue(port)
             self._selected_port_for_view = port
