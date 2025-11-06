@@ -12,6 +12,7 @@ from PyQt5.QtCore import Qt
 import traceback
 import ipaddress
 import time
+import copy
 
 # Optional T-Rex STL imports
 try:
@@ -75,11 +76,45 @@ class TrafficTab(QWidget):
         self.controller = controller
         self.parent_window = parent
         self.composition = []
+        # currently selected flow metadata
+        self._selected_port_for_view = None
+        self._selected_flow_index = None
         self._build_ui()
 
     def _build_ui(self):
         layout = QVBoxLayout()
         self.setLayout(layout)
+
+        # Flow browser area (new): choose port -> list flows (middle) -> edit/save/delete
+        flows_box = QGroupBox("Flow 浏览 (选择端口查看/编辑该端口下的 flows)")
+        fbl = QVBoxLayout(); flows_box.setLayout(fbl)
+        port_row = QHBoxLayout()
+        port_row.addWidget(QLabel("端口:"))
+        self.view_port_sb = QSpinBox(); self.view_port_sb.setRange(0, 65535); self.view_port_sb.setValue(0)
+        port_row.addWidget(self.view_port_sb)
+        self.load_flows_btn = QPushButton("Load Flows"); self.load_flows_btn.clicked.connect(self._on_load_flows_clicked)
+        port_row.addWidget(self.load_flows_btn)
+        fbl.addLayout(port_row)
+
+        mid_row = QHBoxLayout()
+        # flows list (middle)
+        self.flows_list = QListWidget()
+        self.flows_list.currentRowChanged.connect(self.on_flow_selected)
+        mid_row.addWidget(self.flows_list, 2)
+
+        # flow action buttons
+        act_v = QVBoxLayout()
+        self.edit_flow_btn = QPushButton("Edit (加载到层预设界面)"); self.edit_flow_btn.clicked.connect(self._on_edit_flow_clicked)
+        self.save_flow_btn = QPushButton("Save Changes"); self.save_flow_btn.clicked.connect(self._on_save_flow_clicked)
+        self.delete_flow_btn = QPushButton("Delete Flow"); self.delete_flow_btn.clicked.connect(self._on_delete_flow_clicked)
+        act_v.addWidget(self.edit_flow_btn)
+        act_v.addWidget(self.save_flow_btn)
+        act_v.addWidget(self.delete_flow_btn)
+        act_v.addStretch()
+        mid_row.addLayout(act_v, 1)
+
+        fbl.addLayout(mid_row)
+        layout.addWidget(flows_box)
 
         base_row = QHBoxLayout()
         base_row.addWidget(QLabel("流名称:"))
@@ -183,6 +218,210 @@ class TrafficTab(QWidget):
         self.preset_cb.clear()
         for p in LAYER_PRESETS.get(family, []):
             self.preset_cb.addItem(p['name'], p)
+
+    # ---------------- Flow browser helpers ----------------
+    def _on_load_flows_clicked(self):
+        port = int(self.view_port_sb.value())
+        self._selected_port_for_view = port
+        self._refresh_flows_ui(port)
+
+    def _refresh_flows_ui(self, port: int):
+        """
+        Populate the flows_list for the given port from controller.flow_configs.
+        """
+        self.flows_list.clear()
+        flows_for_port = []
+        try:
+            flows_for_port = self.controller.flow_configs.get(port, [])
+        except Exception:
+            flows_for_port = []
+        print(flows_for_port)
+        for idx, f in enumerate(flows_for_port):
+            idx = port
+            name = f.get('name') or f.get('params', {}).get('name') or f"flow_{idx}"
+            item = QListWidgetItem(f"[{idx}] {name}")
+            self.flows_list.addItem(item)
+        # Clear selection and UI so previous flow's config is not retained
+        self._selected_flow_index = None
+        self.composition = []
+        self.composition_list.clear()
+        self.field_table.setRowCount(0)
+        self.preview_te.clear()
+        self.append_status(f"Loaded {len(flows_for_port)} flows for port {port}")
+
+    def on_flow_selected(self, idx: int):
+        """
+        When a flow entry in flows_list is selected, show its brief info in status.
+        Note: does NOT automatically load it for editing into the layer presets (user must click Edit),
+        but still clears previous UI to avoid retaining prior config.
+        """
+        # Clear UI preview of previous selection (to avoid retained data)
+        self.field_table.setRowCount(0)
+        self.composition_list.clear()
+        self.preview_te.clear()
+
+        if idx < 0:
+            self._selected_flow_index = None
+            return
+        port = self._selected_port_for_view
+        if port is None:
+            return
+        try:
+            flows = self.controller.flow_configs.get(port, [])
+            if idx >= len(flows):
+                return
+            flow = flows[idx]
+            self._selected_flow_index = idx
+            # Show a concise summary in status area
+            name = flow.get('name') or flow.get('params', {}).get('name', '')
+            params = flow.get('params', {})
+            comp_len = len(params.get('composition', [])) if isinstance(params, dict) else 0
+            self.append_status(f"Selected flow [{idx}] {name} (layers: {comp_len})")
+        except Exception as e:
+            traceback.print_exc()
+            self.append_status(f"选择 flow 时出错: {e}", "错误")
+
+    def _on_edit_flow_clicked(self):
+        """
+        Load the currently selected flow into the layer presets / composition UI for editing.
+        Replaces any existing composition in the editor (so previous flow config isn't retained).
+        """
+        idx = self._selected_flow_index
+        port = self._selected_port_for_view
+        if port is None or idx is None:
+            QMessageBox.information(self, "未选择", "请先在上方选择端口并选中一个 flow 再点击 Edit。")
+            return
+        flows = self.controller.flow_configs.get(port, [])
+        if idx < 0 or idx >= len(flows):
+            QMessageBox.warning(self, "错误", "选中的 flow 索引无效。")
+            return
+        flow = flows[idx]
+        params = flow.get('params', {})
+        # Clear editor
+        self.composition = []
+        self.composition_list.clear()
+        self.field_table.setRowCount(0)
+        # Load base fields
+        self.flow_name_le.setText(params.get('name', self.flow_name_le.text()))
+        # base fields (if exist)
+        if isinstance(params, dict):
+            if 'src_mac' in params: self.src_mac_le.setText(params.get('src_mac', self.src_mac_le.text()))
+            if 'dst_mac' in params: self.dst_mac_le.setText(params.get('dst_mac', self.dst_mac_le.text()))
+            if 'src_ip' in params: self.src_ip_le.setText(params.get('src_ip', self.src_ip_le.text()))
+            if 'dst_ip' in params: self.dst_ip_le.setText(params.get('dst_ip', self.dst_ip_le.text()))
+            if 'src_port' in params: self.src_port_sb.setValue(int(params.get('src_port') or self.src_port_sb.value()))
+            if 'dst_port' in params: self.dst_port_sb.setValue(int(params.get('dst_port') or self.dst_port_sb.value()))
+            if 'target_ports' in params:
+                self.target_ports_le.setText(",".join([str(x) for x in params.get('target_ports', [])]))
+        # Load composition deep-copied so editing doesn't immediately change stored flow until saved
+        comp = params.get('composition', []) if isinstance(params, dict) else []
+        self.composition = copy.deepcopy(comp)
+        # Populate composition_list UI
+        for layer in self.composition:
+            self.composition_list.addItem(QListWidgetItem(f"{layer.get('family')} - {layer.get('name')}"))
+        self.update_preview()
+        self.append_status(f"Loaded flow [{idx}] into editor for editing.")
+
+    def _on_save_flow_clicked(self):
+        """
+        Save current editor composition/params back into the selected flow (in controller.flow_configs),
+        and persist via controller API if available.
+        """
+        idx = self._selected_flow_index
+        port = self._selected_port_for_view
+        if port is None or idx is None:
+            QMessageBox.information(self, "未选择", "请先选择一个 flow 后再保存。")
+            return
+        params, err = self._collect_params()
+        if err:
+            QMessageBox.warning(self, "保存失败", err)
+            self.append_status(err, "错误")
+            return
+        # Ensure composition in params reflects current editor
+        params['composition'] = copy.deepcopy(self.composition)
+        # Update controller storage
+        try:
+            flows = self.controller.flow_configs.setdefault(port, [])
+            if idx < 0 or idx >= len(flows):
+                QMessageBox.warning(self, "保存失败", "选中的 flow 索引无效")
+                return
+            # update local copy
+            flows[idx]['params'] = params
+            flows[idx]['name'] = params.get('name', flows[idx].get('name'))
+            # attempt controller.update_flow_on_port if exists (preferred), else call add_flow_to_port to persist
+            if hasattr(self.controller, 'update_flow_on_port'):
+                try:
+                    ok, msg = self.controller.update_flow_on_port(port, idx, flows[idx])
+                    if ok:
+                        self.append_status(f"已保存并更新端口 {port} 上的 flow [{idx}] ({msg})", "信息")
+                    else:
+                        self.append_status(f"更新端口 flow 失败: {msg}", "错误")
+                except Exception as e:
+                    traceback.print_exc()
+                    self.append_status(f"调用 controller.update_flow_on_port 失败: {e}", "警告")
+                    # fallback: try add_flow_to_port (may create duplicates)
+                    try:
+                        ok, msg = self.controller.add_flow_to_port(port, flows[idx])
+                        if ok:
+                            self.append_status(f"已使用 add_flow_to_port 保存端口 {port} flow [{idx}] ({msg})", "信息")
+                        else:
+                            self.append_status(f"通过 add_flow_to_port 保存失败: {msg}", "错误")
+                    except Exception as e2:
+                        traceback.print_exc()
+                        self.append_status(f"保存到控制器失败: {e2}", "错误")
+            else:
+                # fallback
+                try:
+                    ok, msg = self.controller.add_flow_to_port(port, flows[idx])
+                    if ok:
+                        self.append_status(f"已保存端口 {port} flow [{idx}] (add_flow_to_port: {msg})", "信息")
+                    else:
+                        self.append_status(f"保存失败: {msg}", "错误")
+                except Exception as e:
+                    traceback.print_exc()
+                    self.append_status(f"调用 controller.add_flow_to_port 失败: {e}", "错误")
+            # refresh list UI to reflect new name
+            self._refresh_flows_ui(port)
+        except Exception as e:
+            traceback.print_exc()
+            self.append_status(f"保存 flow 出错: {e}", "错误")
+
+    def _on_delete_flow_clicked(self):
+        idx = self._selected_flow_index
+        port = self._selected_port_for_view
+        if port is None or idx is None:
+            QMessageBox.information(self, "未选择", "请先选择一个 flow 再删除。")
+            return
+        try:
+            flows = self.controller.flow_configs.get(port, [])
+            if idx < 0 or idx >= len(flows):
+                QMessageBox.warning(self, "删除失败", "选中的 flow 索引无效。")
+                return
+            # try controller API first
+            if hasattr(self.controller, 'remove_flow_from_port'):
+                try:
+                    ok, msg = self.controller.remove_flow_from_port(port, idx)
+                    if ok:
+                        self.append_status(f"已从控制器移除端口 {port} 的 flow [{idx}] ({msg})", "信息")
+                    else:
+                        self.append_status(f"从控制器移除 flow 失败: {msg}", "警告")
+                except Exception as e:
+                    traceback.print_exc()
+                    self.append_status(f"调用 remove_flow_from_port 失败: {e}", "警告")
+            # remove locally
+            try:
+                flows.pop(idx)
+            except Exception:
+                pass
+            self._selected_flow_index = None
+            self.composition = []
+            self.composition_list.clear()
+            self.field_table.setRowCount(0)
+            self._refresh_flows_ui(port)
+            self.append_status(f"Deleted flow [{idx}] for port {port}")
+        except Exception as e:
+            traceback.print_exc()
+            self.append_status(f"删除 flow 出错: {e}", "错误")
 
     # ---------------- Composition operations ----------------
     def on_add_layer(self):
@@ -358,7 +597,8 @@ class TrafficTab(QWidget):
             if not ports:
                 return None, "未解析到有效目标端口"
             params['target_ports'] = sorted(list(set(ports)))
-            params['composition'] = [dict(x) for x in self.composition]
+            # use current editor composition
+            params['composition'] = copy.deepcopy(self.composition)
             return params, None
         except Exception as e:
             traceback.print_exc()
@@ -971,7 +1211,15 @@ class TrafficTab(QWidget):
             QMessageBox.warning(self, "保存失败", err)
             self.append_status(err, "错误")
             return
-        for port in params['target_ports']:
+        ports_text = self.target_ports_le.text().strip()
+        if not ports_text:
+            # 处理空输入
+            ports_list = [0]  # 默认端口
+        else:
+            # 如果输入的是单个端口号，直接使用
+            ports_text = int(ports_text)
+            ports_list = [ports_text]
+        for port in ports_list:
             cfg = {
                 'name': params['name'],
                 'type': 'COMPOSED',
@@ -980,6 +1228,8 @@ class TrafficTab(QWidget):
                 'rx_ports': [port]
             }
             try:
+                if any(conf['name'] == cfg['name'] for conf in self.controller.flow_configs.get(port, [])):
+                    continue
                 ok, msg = self.controller.add_flow_to_port(port, cfg)
                 if ok:
                     self.append_status(f"已保存本地流配置: 端口 {port} ({msg})", "信息")
@@ -988,6 +1238,9 @@ class TrafficTab(QWidget):
             except Exception as e:
                 traceback.print_exc()
                 self.append_status(f"调用控制器保存本地配置失败: {e}", "错误")
+        # refresh flows UI for the currently viewed port if applicable
+        if self._selected_port_for_view is not None:
+            self._refresh_flows_ui(self._selected_port_for_view)
 
     def on_add_to_device(self):
         params, err = self._collect_params()
@@ -1016,12 +1269,25 @@ class TrafficTab(QWidget):
                         'rx_ports': [port],
                         'vm_desc': streams_or_infos
                     }
-                    ok, msg = self.controller.add_flow_to_port(port, cfg)
-                    if ok:
-                        self.append_status(f"已保存本地流配置(回退): 端口 {port} ({msg})", "信息")
-                    else:
-                        self.append_status(f"保存本地流失败(回退): 端口 {port} ({msg})", "错误")
-                    continue
+                    #ok, msg = self.controller.add_flow_to_port(port, cfg)
+                    #if ok:
+                    #    # keep local cache
+                    #    try:
+                    #        self.controller.flow_configs.setdefault(port, []).append({
+                    #            'name': cfg['name'],
+                    #            'type': cfg['type'],
+                    #            'params': cfg['params'],
+                    #            'tx_ports': cfg['tx_ports'],
+                    #            'rx_ports': cfg['rx_ports'],
+                    #            'vm_desc': cfg.get('vm_desc'),
+                    #            'active': False
+                    #        })
+                    #    except Exception:
+                    #        pass
+                    #    self.append_status(f"已保存本地流配置(回退): 端口 {port} ({msg})", "信息")
+                    #else:
+                    #    self.append_status(f"保存本地流失败(回退): 端口 {port} ({msg})", "错误")
+                    #continue
 
                 # streams_or_infos is list of STLStream
                 for s_i, stream in enumerate(streams_or_infos):
@@ -1058,24 +1324,32 @@ class TrafficTab(QWidget):
                                 self.on_save_local()
                                 continue
                     # store metadata in controller.flow_configs
-                    stored = {
-                        'name': params['name'],
-                        'type': 'COMPOSED',
-                        'params': params,
-                        'pgid': pgid,
-                        'stream': stream,
-                        'tx_ports': [port],
-                        'rx_ports': [port],
-                        'active': False
-                    }
-                    self.controller.flow_configs[port].append(stored)
+                    #stored = {
+                    #    'name': params['name'],
+                    #    'type': 'COMPOSED',
+                    #    'params': params,
+                    #    'pgid': pgid,
+                    #    'stream': stream,
+                    #    'tx_ports': [port],
+                    #    'rx_ports': [port],
+                    #    'active': False
+                    #}
+                    #self.controller.flow_configs[port].append(stored)
                     self.append_status(f"已下发流到 T-Rex (port={port}, pgid={pgid})", "信息")
 
             except Exception as e:
                 traceback.print_exc()
                 self.append_status(f"端口 {port} 下发失败: {e}", "错误")
                 QMessageBox.warning(self, "下发失败", f"端口 {port} 下发失败: {e}")
+        # refresh flows UI for currently viewed port
+        if self._selected_port_for_view is not None:
+            self._refresh_flows_ui(self._selected_port_for_view)
 
     def refresh_flow_list_for_port(self, port: int):
         # placeholder for compatibility
-        pass
+        try:
+            self.view_port_sb.setValue(port)
+            self._selected_port_for_view = port
+            self._refresh_flows_ui(port)
+        except Exception:
+            pass
