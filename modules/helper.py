@@ -29,12 +29,12 @@ class HelperFunctions:
     def format_pps(pps: float) -> str:
         """格式化PPS（每秒包数）显示"""
         if pps >= 1e9:
-            return f"{pps/1e9:.2f} Gpps"
+            return f"{pps/1e9:.2f}gpps"
         elif pps >= 1e6:
-            return f"{pps/1e6:.2f} Mpps"
+            return f"{pps/1e6:.2f}mpps"
         elif pps >= 1e3:
-            return f"{pps/1e3:.2f} Kpps"
-        return f"{pps:.0f} pps"
+            return f"{pps/1e3:.2f}kpps"
+        return f"{pps:.0f}pps"
 
     @staticmethod
     def format_bytes(bytes_val: float) -> str:
@@ -172,7 +172,7 @@ class HelperFunctions:
         """将端口列表转换为字符串"""
         return ','.join(map(str, ports))
 
-   def _is_ip(self, s: str):
+    def _is_ip(self, s: str):
         try:
             if ':' in str(s):
                 ipaddress.IPv6Address(str(s))

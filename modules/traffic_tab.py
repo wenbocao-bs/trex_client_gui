@@ -13,8 +13,9 @@ import traceback
 import ipaddress
 import time
 import copy
-from helper import helper, packet_parser, stats_calculator
-from helper import format_bps, format_pps, format_bytes
+from modules.helper import HelperFunctions
+#from helper import helper, packet_parser, stats_calculator
+#from helper import format_bps, format_pps, format_bytes
 
 # Optional T-Rex STL imports
 try:
@@ -27,32 +28,178 @@ except Exception:
 # Optional scapy import for building/previewing composed packets
 try:
     import scapy.all as scapy
+    #import scapy.all as scapy
+    #from scapy.layers.l2 import LLC,SNAP,MPLS,LLDPDU,Dot1Q,Dot1AD,SNAP
+    from scapy.layers.l2 import LLC, SNAP, STP, Dot3, Ether
+    from scapy.layers.l2 import Dot3
+    #from scapy.layers.l2 import MPLS  # MPLS 在大多数版本中也在 l2 层
+   # from scapy.layers.vxlan import NSH  # NSH 通常在 vxlan 模块中
     SCAPY_AVAILABLE = True
 except Exception:
     scapy = None
     SCAPY_AVAILABLE = False
+    exit()
 
 # Layer presets (template contains placeholders like {src_ip}, {dst_port} etc.)
 LAYER_PRESETS = {
     'L2': [
-        {'id': 'eth', 'name': 'Ethernet', 'template': "Ether(dst='{dst_mac}', src='{src_mac}')"},
-        {'id': 'vlan', 'name': '802.1Q VLAN', 'template': "Dot1Q(vlan={vlan_id}, prio={vlan_prio})"},
+        # Ethernet family
+        {'id': 'eth', 'name': 'Ethernet', 'template': "Ether(dst='{dst_mac}', src='{src_mac}')",
+         'fields': {
+             'dst_mac': {'mode':'fixed','value':'00:02:00:03:04:02','start':'00:02:00:03:04:02','end':'00:02:00:03:04:02','step':1},
+             'src_mac': {'mode':'fixed','value':'00:03:00:01:40:01','start':'00:03:00:01:40:01','end':'00:03:00:01:40:01','step':1},
+         }
+        },
+        {'id': 'dot3', 'name': 'Ethernet', 'template': "Dot3(dst='{dst_mac}', src='{src_mac}')",
+          'fields': {
+             'dst_mac': {'mode':'fixed','value':'ff:ff:ff:ff:ff:ff','start':'00:02:00:03:04:02','end':'00:02:00:03:04:02','step':1},
+             'src_mac': {'mode':'fixed','value':'00:03:00:01:40:01','start':'00:03:00:01:40:01','end':'00:03:00:01:40:01','step':1},
+         }
+        },
+        {'id': 'dot1q', 'name': 'Dot1Q (802.1Q)', 'template': "Dot1Q(vlan={vlan_id}, prio={vlan_prio})",
+         'fields': {'vlan_id': {'mode':'fixed','value':100,'start':1,'end':4094,'step':1}, 'vlan_prio': {'mode':'fixed','value':0,'start':0,'end':7,'step':1}}},
+        {'id': 'dot1ad', 'name': 'Dot1AD (Q-in-Q)', 'template': "Dot1Q(vlan={outer_vlan})/Dot1Q(vlan={inner_vlan})",
+         'fields': {'outer_vlan': {'mode':'fixed','value':100,'start':1,'end':4094,'step':1}, 'inner_vlan': {'mode':'fixed','value':200,'start':1,'end':4094,'step':1}}},
+        {'id': 'mpls', 'name': 'MPLS', 'template': "MPLS(label={label})", 'fields': {'label': {'mode':'fixed','value':1000,'start':0,'end':1048575,'step':1}}},
+        # Discovery / control
+        {'id': 'lldp', 'name': 'LLDPDU', 'template': "LLDPDU()", 'fields': {}},
+        {'id': 'eapol', 'name': 'EAPOL', 'template': "EAPOL()", 'fields': {}},
+        {'id': 'stp', 'name': 'STP', 'template': "STP()", 'fields': {}},
+        {'id': 'cdp', 'name': 'CDP', 'template': "CDP()", 'fields': {}},
+        # Other L2: SNAP/LLC/etc
+        {'id': 'llc', 'name': 'LLC', 'template': "LLC()",'fields': {}},
+        {'id': 'snap', 'name': 'SNAP', 'template': "SNAP()",'fields': {}},
+        {'id': 'jumbo', 'name': 'Jumbo', 'template': "Jumbo()", 'fields': {}},
+        {'id': 'tokenring', 'name': 'TokenRing', 'template': "TokenRing()", 'fields': {}},
+        {'id': 'fddi', 'name': 'FDDI', 'template': "FDDI()", 'fields': {}},
+        {'id': 'linuxsll', 'name': 'Linux SLL/Cooked', 'template': "Ether()", 'fields': {}},
     ],
+    # Wireless (802.11) / RadioTap and many 802.11 related elements
+    'WIRELESS': [
+        {'id': 'radiotap', 'name': 'RadioTap', 'template': "RadioTap()", 'fields': {}},
+        {'id': 'dot11', 'name': 'Dot11', 'template': "Dot11(addr1='{dst_mac}', addr2='{src_mac}', addr3='{bssid}')",
+         'fields': {'dst_mac': {'mode':'fixed','value':'ff:ff:ff:ff:ff:ff','start':'ff:ff:ff:ff:ff:ff','end':'ff:ff:ff:ff:ff:ff','step':1},
+                    'src_mac': {'mode':'fixed','value':'00:03:00:01:40:01','start':'00:03:00:01:40:01','end':'00:03:00:01:40:01','step':1},
+                    'bssid': {'mode':'fixed','value':'00:11:22:33:44:55','start':'00:11:22:33:44:55','end':'00:11:22:33:44:55','step':1}}},
+        {'id': 'dot11beacon', 'name': 'Dot11Beacon', 'template': "Dot11Beacon()/Dot11Elt()", 'fields': {}},
+        {'id': 'dot11probereq', 'name': 'Dot11ProbeReq', 'template': "Dot11ProbeReq()", 'fields': {}},
+        {'id': 'dot11proberesp', 'name': 'Dot11ProbeResp', 'template': "Dot11ProbeResp()", 'fields': {}},
+        {'id': 'dot11auth', 'name': 'Dot11Auth', 'template': "Dot11Auth()", 'fields': {}},
+        {'id': 'dot11assocreq', 'name': 'Dot11AssoReq', 'template': "Dot11AssoReq()", 'fields': {}},
+        {'id': 'dot11assocresp', 'name': 'Dot11AssoResp', 'template': "Dot11AssoResp()", 'fields': {}},
+        {'id': 'dot11reassoreq', 'name': 'Dot11ReassoReq', 'template': "Dot11ReassoReq()", 'fields': {}},
+        {'id': 'dot11reassoresp', 'name': 'Dot11ReassoResp', 'template': "Dot11ReassoResp()", 'fields': {}},
+        {'id': 'dot11disas', 'name': 'Dot11Disas', 'template': "Dot11Disas()", 'fields': {}},
+        {'id': 'dot11deauth', 'name': 'Dot11Deauth', 'template': "Dot11Deauth()", 'fields': {}},
+        {'id': 'dot11ack', 'name': 'Dot11Ack', 'template': "Dot11Ack()", 'fields': {}},
+        {'id': 'dot11rts', 'name': 'Dot11RTS', 'template': "Dot11RTS()", 'fields': {}},
+        {'id': 'dot11cts', 'name': 'Dot11CTS', 'template': "Dot11CTS()", 'fields': {}},
+        {'id': 'dot11wep', 'name': 'Dot11WEP', 'template': "Dot11WEP()", 'fields': {}},
+        {'id': 'dot11qos', 'name': 'Dot11QoS', 'template': "Dot11QoS()", 'fields': {}},
+        {'id': 'dot11data', 'name': 'Dot11Data', 'template': "Dot11Data()", 'fields': {}},
+        {'id': 'dot11elt', 'name': 'Dot11Elt', 'template': "Dot11Elt()", 'fields': {}},
+        {'id': 'radiotap_prism', 'name': 'PrismHeader', 'template': "PrismHeader()", 'fields': {}},
+        # Bluetooth / Zigbee
+        {'id': 'l2cap', 'name': 'L2CAP_Hdr', 'template': "L2CAP_Hdr()", 'fields': {}},
+        {'id': 'zigbeenwk', 'name': 'ZigbeeNWK', 'template': "ZigbeeNWK()", 'fields': {}},
+        {'id': 'zigbeeapp', 'name': 'ZigbeeAppDataPayload', 'template': "ZigbeeAppDataPayload()", 'fields': {}},
+    ],
+
     'L3': [
-        {'id': 'ipv4', 'name': 'IPv4', 'template': "IP(src='{src_ip}', dst='{dst_ip}')"},
-        {'id': 'ipv6', 'name': 'IPv6', 'template': "IPv6(src='{src_ipv6}', dst='{dst_ipv6}')"},
+        {'id': 'ipv4', 'name': 'IPv4', 'template': "IP(src='{src_ip}', dst='{dst_ip}', ttl={ttl})",
+         'fields': {'src_ip': {'mode':'fixed','value':'16.0.0.1','start':'16.0.0.1','end':'16.0.0.1','step':1},
+                    'dst_ip': {'mode':'fixed','value':'48.0.0.1','start':'48.0.0.1','end':'48.0.0.1','step':1},
+                    'ttl': {'mode':'fixed','value':64,'start':1,'end':255,'step':1}}},
+        {'id': 'ipv6', 'name': 'IPv6', 'template': "IPv6(src='{src_ipv6}', dst='{dst_ipv6}', hlim={hlim})",
+         'fields': {'src_ipv6': {'mode':'fixed','value':'fc00::1','start':'fc00::1','end':'fc00::1','step':1},
+                    'dst_ipv6': {'mode':'fixed','value':'fd00::2','start':'fd00::2','end':'fd00::2','step':1},
+                    'hlim': {'mode':'fixed','value':64,'start':1,'end':255,'step':1}}},
+
+        # Address resolution and ARP family
+        {'id': 'arp', 'name': 'ARP', 'template': "ARP(psrc='{src_ip}', pdst='{dst_ip}', hwsrc='{src_mac}', hwdst='{dst_mac}', op={op})",
+         'fields': {'src_ip': {'mode':'fixed','value':'16.0.0.1','start':'16.0.0.1','end':'16.0.0.1','step':1},
+                    'dst_ip': {'mode':'fixed','value':'48.0.0.1','start':'48.0.0.1','end':'48.0.0.1','step':1},
+                    'src_mac': {'mode':'fixed','value':'00:03:00:01:40:01','start':'00:03:00:01:40:01','end':'00:03:00:01:40:01','step':1},
+                    'dst_mac': {'mode':'fixed','value':'ff:ff:ff:ff:ff:ff','start':'ff:ff:ff:ff:ff:ff','end':'ff:ff:ff:ff:ff:ff','step':1},
+                    'op': {'mode':'fixed','value':1,'start':1,'end':2,'step':1}}},
     ],
+
     'L4': [
-        {'id': 'udp', 'name': 'UDP', 'template': "UDP(sport={src_port}, dport={dst_port})"},
-        {'id': 'tcp', 'name': 'TCP', 'template': "TCP(sport={src_port}, dport={dst_port})"},
+        {'id': 'udp', 'name': 'UDP', 'template': "UDP(sport={src_port}, dport={dst_port})",
+         'fields': {'src_port': {'mode':'fixed','value':1025,'start':1,'end':65535,'step':1},
+                    'dst_port': {'mode':'fixed','value':80,'start':1,'end':65535,'step':1}}},
+        {'id': 'tcp', 'name': 'TCP', 'template': "TCP(sport={src_port}, dport={dst_port}, flags='{flags}')",
+         'fields': {'src_port': {'mode':'fixed','value':1025,'start':1,'end':65535,'step':1},
+                    'dst_port': {'mode':'fixed','value':80,'start':1,'end':65535,'step':1},
+                    'flags': {'mode':'fixed','value':'','start':'','end':'','step':1}}},
+        {'id': 'sctp', 'name': 'SCTP', 'template': "SCTP(sport={src_port}, dport={dst_port})",
+         'fields': {'src_port': {'mode':'fixed','value':5000,'start':1,'end':65535,'step':1},
+                    'dst_port': {'mode':'fixed','value':5001,'start':1,'end':65535,'step':1}}},
+        # Common transport placeholders
+        {'id': 'raw', 'name': 'RawPayload', 'template': "Raw(load={raw_bin})", 'fields': {'raw_bin': {'mode':'fixed','value':"b'\\x00'","start":"b'\\x00'","end":"b'\\x00'","step":1}}}
     ],
+
     'TUNNEL': [
-        {'id': 'vxlan', 'name': 'VXLAN (placeholder)', 'template': "VXLAN(vni={vni})"},
-        {'id': 'gre', 'name': 'GRE (placeholder)', 'template': "GRE()"},
+        {'id': 'vxlan', 'name': 'VXLAN', 'template': "VXLAN(vni={vni})",
+         'fields': {'vni': {'mode':'fixed','value':10,'start':1,'end':16777215,'step':1}}},
+        {'id': 'geneve', 'name': 'GENEVE', 'template': "GENEVE(vni={vni})",
+         'fields': {'vni': {'mode':'fixed','value':20,'start':1,'end':16777215,'step':1}}},
+        {'id': 'nvgre', 'name': 'NVGRE', 'template': "NVGRE()", 'fields': {}},
+        {'id': 'ipip', 'name': 'IP-in-IP', 'template': "IP(src='{tunnel_src}', dst='{tunnel_dst}')",
+         'fields': {'tunnel_src': {'mode':'fixed','value':'10.0.0.1','start':'10.0.0.1','end':'10.0.0.1','step':1}, 'tunnel_dst': {'mode':'fixed','value':'10.0.0.2','start':'10.0.0.2','end':'10.0.0.2','step':1}}},
+        {'id': 'gre', 'name': 'GRE', 'template': "GRE()", 'fields': {}},
+        {'id': 'erspan', 'name': 'ERSPAN', 'template': "ERSPAN()", 'fields': {}},
+        {'id': 'teb', 'name': 'TEB', 'template': "TEB()", 'fields': {}},
+        {'id': 'linux_sll', 'name': 'LinuxCooked', 'template': "CookedLinux()", 'fields': {}},
+        {'id': 'loopback', 'name': 'Loopback', 'template': "Loopback()", 'fields': {}}
     ],
-    'Raw': [
-        {'id': 'raw', 'name': 'Raw', 'template': "Raw(load={raw_bin})"},
+
+    # WAN protocols (best-effort templates)
+    'WAN': [
+        {'id': 'ppp', 'name': 'PPP', 'template': "PPP()", 'fields': {}},
+        {'id': 'pppoe', 'name': 'PPPoE', 'template': "PPPoE()", 'fields': {}},
+        {'id': 'pppoed', 'name': 'PPPoE_Discovery', 'template': "PPPoED()", 'fields': {}},
+        {'id': 'hdlc', 'name': 'HDLC', 'template': "HDLC()", 'fields': {}},
+        {'id': 'fr', 'name': 'FrameRelay', 'template': "FrameRelay()", 'fields': {}},
+        {'id': 'chdlc', 'name': 'CHDLC', 'template': "CHDLC()", 'fields': {}},
+        {'id': 'ciscohdlc', 'name': 'CISCO_HDLC', 'template': "CISCO_HDLC()", 'fields': {}},
+    ],
+
+    # Industrial protocols (placeholders; some require additional scapy contribs)
+    'INDUSTRIAL': [
+        {'id': 'can', 'name': 'CAN', 'template': "CAN()", 'fields': {}},
+        {'id': 'profinet', 'name': 'PROFINET', 'template': "PROFINET()", 'fields': {}},
+        {'id': 'ethercat', 'name': 'EtherCAT', 'template': "EtherCAT()", 'fields': {}},
+        {'id': 's7', 'name': 'S7Comm', 'template': "S7Comm()", 'fields': {}},
+        {'id': 'cotp', 'name': 'COTP', 'template': "COTP()", 'fields': {}},
+        {'id': 'tpkt', 'name': 'TPKT', 'template': "TPKT()", 'fields': {}},
+        {'id': 'iso_802_3', 'name': 'ISO_802_3', 'template': "ISO_802_3()", 'fields': {}},
+    ],
+
+    # Storage network protocols
+    'STORAGE': [
+        {'id': 'fc', 'name': 'FibreChannel', 'template': "FC()", 'fields': {}},
+        {'id': 'fcoe', 'name': 'FCoE', 'template': "FCoE()", 'fields': {}},
+        {'id': 'iscsi', 'name': 'iSCSI', 'template': "iSCSI()", 'fields': {}},
+    ],
+
+    # Encapsulation / misc
+    'ENCAP': [
+        {'id': 'vxlan_enc', 'name': 'VXLAN (encap)', 'template': "VXLAN(vni={vni})", 'fields': {'vni': {'mode':'fixed','value':10,'start':0,'end':16777215,'step':1}}},
+        {'id': 'geneve_enc', 'name': 'GENEVE (encap)', 'template': "GENEVE(vni={vni})", 'fields': {'vni': {'mode':'fixed','value':20,'start':0,'end':16777215,'step':1}}},
+        {'id': 'nvgre_enc', 'name': 'NVGRE', 'template': "NVGRE()", 'fields': {}},
+        {'id': 'erspan_enc', 'name': 'ERSPAN', 'template': "ERSPAN()", 'fields': {}},
+        {'id': 'linux_cooked', 'name': 'LinuxCooked', 'template': "CookedLinux()", 'fields': {}},
+    ],
+
+    # Address resolution & related
+    'ADDR': [
+        {'id': 'arp', 'name': 'ARP', 'template': "ARP()", 'fields': {}},
+        {'id': 'rarp', 'name': 'RARP', 'template': "RARP()", 'fields': {}},
+        {'id': 'garp', 'name': 'GARP', 'template': "GARP()", 'fields': {}},
+        {'id': 'inarp', 'name': 'InARP', 'template': "InARP()", 'fields': {}},
     ]
+
 }
 
 FIELD_MODES = ['fixed', 'inc', 'dec', 'random']
@@ -82,6 +229,7 @@ class TrafficTab(QWidget):
     def __init__(self, controller, parent=None):
         super().__init__(parent)
         self.controller = controller
+        self.helper = HelperFunctions()
         self.parent_window = parent
         self.composition = []
         # currently selected flow metadata
@@ -272,6 +420,12 @@ class TrafficTab(QWidget):
 
         layout.addLayout(action_row)
 
+        runtime_row = QHBoxLayout()
+        runtime_row.addWidget(QLabel("流运行时间:"))
+        self.runtime_label = QLabel("00:00:00")
+        runtime_row.addWidget(self.runtime_label)
+        runtime_row.addStretch()
+        layout.addLayout(runtime_row)
         self.status_te = QTextEdit(); self.status_te.setReadOnly(True); self.status_te.setMaximumHeight(140)
         layout.addWidget(self.status_te)
 
@@ -390,10 +544,6 @@ class TrafficTab(QWidget):
         self._load_flow_into_editor(port, row)
 
     def _load_flow_into_editor(self, port, idx):
-        """
-        加载 flow 到编辑器：对所有可能为 None 的字段做了 safe 转换，
-        并在 UI 上展示 run_duration（运行时长）。
-        """
         try:
             flows = self.controller.flow_configs.get(port, [])
             if idx < 0 or idx >= len(flows):
@@ -463,6 +613,20 @@ class TrafficTab(QWidget):
                 self.composition_list.addItem(QListWidgetItem(f"{layer.get('family')} - {layer.get('name')}"))
             self.update_preview()
             self.append_status(f"Loaded flow [{idx}] from port {port} into editor for editing.")
+            runtime = flow.get('run_time', None)
+            if runtime is not None:
+                try:
+                    # runtime is seconds
+                    hh = int(runtime) // 3600
+                    mm = (int(runtime) % 3600) // 60
+                    ss = int(runtime) % 60
+                    self.runtime_label.setText(f"{hh:02d}:{mm:02d}:{ss:02d}")
+                except Exception:
+                    pass
+            else:
+                self.runtime_label.setText("00:00:00")
+            self.append_status(f"Loaded flow [{idx}] into editor.")
+
         except Exception as e:
             traceback.print_exc()
             self.append_status(f"加载 flow 到编辑器出错: {e}", "错误")
@@ -596,7 +760,7 @@ class TrafficTab(QWidget):
 
             # If pps is set, do NOT pass percentage to controller (pps takes precedence)
             if pps:
-                pps = helper.format_pps(pps)
+                pps = self.helper.format_pps(pps)
                 rate_to_pass = None
             else:
                 rate_to_pass = rate_percent
@@ -613,7 +777,7 @@ class TrafficTab(QWidget):
                         streams=streams,
                         ports=[port],
                         rate_percent=rate_to_pass,
-                        pps=None,
+                        pps=pps,
                         duration=run_duration
                     )
                     if success:
@@ -780,18 +944,33 @@ class TrafficTab(QWidget):
         template = preset['template']
         placeholders = extract_placeholders(template)
         fields = {}
+        preset_fields = preset.get('fields', {}) or {}
+        for fname, fcfg in preset_fields.items():
+            fc = dict(fcfg)
+            fc.setdefault('mode', 'fixed')
+            fc.setdefault('value', fc.get('value', ''))
+            fc.setdefault('start', fc.get('start', fc.get('value', '')))
+            fc.setdefault('end', fc.get('end', fc.get('start', fc.get('value', ''))))
+            fc.setdefault('step', int(fc.get('step', 1) or 1))
+            fc['name'] = fname
+            fields[fname] = fc
+        # defaults for common placeholders
         defaults = {
             'src_mac': self.src_mac_le.text().strip(),
             'dst_mac': self.dst_mac_le.text().strip(),
             'src_ip': self.src_ip_le.text().strip(),
             'dst_ip': self.dst_ip_le.text().strip(),
-            'src_ipv6': "FC00:0000:130F:0000:0000:09C0:876A:130B",
-            'dst_ipv6': "0000:0000:130F:0000:0000:09C0:876A:FFFF",
+            'src_ipv6': "fc00::1",
+            'dst_ipv6': "fd00::2",
             'src_port': int(self.src_port_sb.value()),
             'dst_port': int(self.dst_port_sb.value()),
-            'vni':, 10
             'vlan_id': 100,
-            'vlan_prio': 0
+            'vlan_prio': 0,
+            'vni': 10,
+            'eth_type': 2048,
+            'ttl': 64,
+            'hlim': 64,
+            'flags': ''
         }
         for ph in placeholders:
             fld = {'mode':'fixed', 'value':defaults.get(ph, ''), 'start':defaults.get(ph, ''), 'end':defaults.get(ph, ''), 'step':1}
@@ -941,7 +1120,7 @@ class TrafficTab(QWidget):
             # composition from editor
             params['composition'] = copy.deepcopy(self.composition)
 
-            # packet length params
+            # packet length param
             pkt_len = {
                 'mode': self.pktlen_mode_cb.currentText(),
                 'value': int(self.pktlen_val_sb.value()),
@@ -949,9 +1128,7 @@ class TrafficTab(QWidget):
                 'end': int(self.pktlen_end_sb.value()),
                 'step': int(self.pktlen_step_sb.value())
             }
-            params['pkt_len'] = pkt_len
-
-            # rate / pps
+            params['pkt_len'] = pkt_len            # rate / pps
             params['rate_percent'] = int(self.rate_percent_sb.value())
             pps_val = int(self.pps_sb.value())
             params['pps'] = pps_val if pps_val > 0 else None
@@ -1070,42 +1247,6 @@ class TrafficTab(QWidget):
                 return field_cfg.get('value', '')
         return field_cfg.get('value', '')
 
-    # ---------------- Build packet from composition ----------------
-    def build_packet_from_composition_for_index(self, composition, seq_index):
-        parts = []
-        for layer in composition:
-            tpl = layer.get('template', '')
-            fields = layer.get('fields', {})
-            subs = {}
-            for k, cfg in fields.items():
-                subs[k] = self.resolve_field_value(cfg, seq_index)
-            try:
-                part = tpl.format(**subs)
-            except Exception:
-                part = tpl
-            parts.append(part)
-        expr = " / ".join(parts)
-        if SCAPY_AVAILABLE:
-            try:
-                ctx = {
-                    'Ether': scapy.Ether,
-                    'Dot1Q': getattr(scapy, 'Dot1Q', None),
-                    'IP': scapy.IP,
-                    'IPv6': scapy.IPv6,
-                    'UDP': scapy.UDP,
-                    'TCP': scapy.TCP,
-                    'GRE': getattr(scapy, 'GRE', None),
-                    'VXLAN': getattr(scapy, 'VXLAN', None),
-                    'Raw': scapy.Raw,
-                }
-                pkt = eval(expr, {}, ctx)
-                return expr, pkt
-            except Exception:
-                traceback.print_exc()
-                return expr, None
-        else:
-            return expr, None
-
     def _compute_pkt_sizes_from_params(self, params):
         """
         根据 params['pkt_len'] 生成 sizes 列表用于 create_streams_from_composition。
@@ -1195,10 +1336,17 @@ class TrafficTab(QWidget):
                     for layer in comp:
                         tpl = layer.get('template','')
                         fields = layer.get('fields', {})
+                        # detect layer type by template/preset id heuristics
                         if 'Ether' in tpl or layer.get('preset_id','').lower() == 'eth':
                             src = fields.get('src_mac',{}).get('value') or params.get('src_mac')
                             dst = fields.get('dst_mac',{}).get('value') or params.get('dst_mac')
                             layers.append(scapy.Ether(src=src, dst=dst))
+                        elif 'Dot3' in tpl or layer.get('preset_id','').lower() == 'dot3':
+                            src = fields.get('src_mac',{}).get('value') or params.get('src_mac')
+                            dst = fields.get('dst_mac',{}).get('value') or params.get('dst_mac')
+                            layers.append(scapy.Dot3(src=src, dst=dst))
+                        elif 'LLC' in tpl or layer.get('preset_id','').lower() == 'llc':
+                            layers.append(scapy.LLC())
                         elif 'Dot1Q' in tpl or layer.get('preset_id','').lower() == 'vlan':
                             vlan_id = fields.get('vlan_id',{}).get('value') or params.get('vlan_id')
                             vlan_prio = fields.get('vlan_prio',{}).get('value') or params.get('vlan_prio')
@@ -1206,11 +1354,21 @@ class TrafficTab(QWidget):
                         elif 'IPv6' in tpl or layer.get('preset_id','').lower() == 'ipv6':
                             src = fields.get('src_ipv6',{}).get('value') or params.get('src_ipv6')
                             dst = fields.get('dst_ipv6',{}).get('value') or params.get('dst_ipv6')
-                            layers.append(scapy.IPv6(src=src, dst=dst))
-                        elif 'IP(' in tpl or layer.get('preset_id','').lower() == 'ipv4':
+                            hlim = fields.get('hlim',{}).get('value') or params.get('hlim')
+                            if hlim is None:
+                                pkt_ipv6 = scapy.IPv6(src=src, dst=dst)
+                            else:
+                                pkt_ipv6 = scapy.IPv6(src=src, dst=dst, hlim=int(hlim))
+                            layers.append(pkt_ipv6)
+                        elif 'IP(' in tpl or layer.get('preset_id','').lower() == 'ipv4' or layer.get('preset_id','').lower() == 'ipip':
                             src = fields.get('src_ip',{}).get('value') or params.get('src_ip')
                             dst = fields.get('dst_ip',{}).get('value') or params.get('dst_ip')
-                            layers.append(scapy.IP(src=src, dst=dst))
+                            ttl = fields.get('ttl',{}).get('value') or params.get('ttl')
+                            if ttl is None:
+                                pkt_ip = scapy.IP(src=src, dst=dst)
+                            else:
+                                pkt_ip = scapy.IP(src=src, dst=dst, ttl=int(ttl))
+                            layers.append(pkt_ip)
                         elif 'UDP' in tpl or layer.get('preset_id','').lower() == 'udp':
                             sport = int(fields.get('src_port',{}).get('value') or params.get('src_port') or 1025)
                             dport = int(fields.get('dst_port',{}).get('value') or params.get('dst_port') or 80)
@@ -1218,7 +1376,66 @@ class TrafficTab(QWidget):
                         elif 'TCP' in tpl or layer.get('preset_id','').lower() == 'tcp':
                             sport = int(fields.get('src_port',{}).get('value') or params.get('src_port') or 1025)
                             dport = int(fields.get('dst_port',{}).get('value') or params.get('dst_port') or 80)
-                            layers.append(scapy.TCP(sport=sport, dport=dport))
+                            flags = fields.get('flags',{}).get('value') or params.get('flags') or ''
+                            layers.append(scapy.TCP(sport=sport, dport=dport, flags=flags))
+                        elif 'SCTP' in tpl or layer.get('preset_id','').lower() == 'sctp':
+                            # scapy may or may not have SCTP class available
+                            sport = int(fields.get('src_port',{}).get('value') or params.get('src_port') or 5000)
+                            dport = int(fields.get('dst_port',{}).get('value') or params.get('dst_port') or 5001)
+                            SCTP_cls = getattr(scapy, 'SCTP', None)
+                            if SCTP_cls:
+                                layers.append(SCTP_cls(sport=sport, dport=dport))
+                            else:
+                                # fallback: create UDP placeholder if SCTP not available
+                                layers.append(scapy.UDP(sport=sport, dport=dport))
+                        elif 'VXLAN' in tpl or layer.get('preset_id','').lower() == 'vxlan':
+                            vni = int(fields.get('vni',{}).get('value') or params.get('vni') or 0)
+                            VXLAN_cls = getattr(scapy, 'VXLAN', None)
+                            if VXLAN_cls:
+                                layers.append(VXLAN_cls(vni=vni))
+                            else:
+                                # no vxlan in scapy, skip
+                                pass
+                        elif 'GENEVE' in tpl or layer.get('preset_id','').lower() == 'geneve':
+                            # scapy GENEVE support may vary
+                            GENEVE_cls = getattr(scapy, 'GENEVE', None)
+                            vni = int(fields.get('vni',{}).get('value') or params.get('vni') or 0)
+                            if GENEVE_cls:
+                                layers.append(GENEVE_cls(vni=vni))
+                        elif 'GRE' in tpl or layer.get('preset_id','').lower() == 'gre':
+                            GRE_cls = getattr(scapy, 'GRE', None)
+                            if GRE_cls:
+                                layers.append(GRE_cls())
+                        elif 'Raw' in tpl or layer.get('preset_id','').lower() == 'raw':
+                            raw_val = fields.get('raw_bin',{}).get('value') or b'\x00'
+                            # attempt to eval a bytes literal safely
+                            try:
+                                raw_bytes = eval(raw_val) if isinstance(raw_val, str) else raw_val
+                            except Exception:
+                                raw_bytes = b'\x00'
+                            layers.append(scapy.Raw(load=raw_bytes))
+                        else:
+                            # Unknown template: try to eval template after substituting fixed values
+                            try:
+                                subs = {}
+                                for k, v in fields.items():
+                                    if v.get('mode') == 'fixed':
+                                        subs[k] = v.get('value', '')
+                                    else:
+                                        subs[k] = "{" + k + "}"
+                                part = tpl.format(**subs)
+                                # attempt to eval with scapy context
+                                ctx = {'Ether': scapy.Ether, 'Dot1Q': getattr(scapy, 'Dot1Q', None),
+                                       'IP': scapy.IP, 'IPv6': getattr(scapy, 'IPv6', None),
+                                       'UDP': scapy.UDP, 'TCP': getattr(scapy, 'TCP', None),
+                                       'SCTP': getattr(scapy, 'SCTP', None),
+                                       'GRE': getattr(scapy, 'GRE', None), 'VXLAN': getattr(scapy, 'VXLAN', None),
+                                       'Raw': scapy.Raw}
+                                pkt_layer = eval(part, {}, ctx)
+                                layers.append(pkt_layer)
+                            except Exception:
+                                traceback.print_exc()
+                                pass
                     if not layers:
                         eth_layer = scapy.Ether(
                             src=self.src_mac_le.text().strip() or '00:03:00:01:40:01',
@@ -1239,8 +1456,7 @@ class TrafficTab(QWidget):
                     if sz:
                         current_size = len(bytes(pkt))
                         if sz > current_size:
-                            payload_size = sz - current_size
-                            pkt = pkt / scapy.Raw(load=b'X' * payload_size)
+                            pkt = pkt / scapy.Raw(load=b'X' * (sz - current_size))
                     return pkt
             except Exception as e:
                 self.append_status(f"构建基础报文失败: {str(e)}", "错误")
@@ -1262,6 +1478,8 @@ class TrafficTab(QWidget):
                     l4_guess = 'TCP'; break
                 if layer.get('preset_id','').lower() == 'udp':
                     l4_guess = 'UDP'; break
+                if layer.get('preset_id','').lower() == 'sctp':
+                    l4_guess = 'SCTP'; break
         if not l4_guess:
             l4_guess = 'UDP'
 
@@ -1383,6 +1601,7 @@ class TrafficTab(QWidget):
             else:
                 is_scapy_pkt = False
 
+            print(SCAPY_AVAILABLE)
             if not is_scapy_pkt:
                 if isinstance(pkt_template, bytes):
                     pkt_bytes = pkt_template
@@ -1580,8 +1799,8 @@ class TrafficTab(QWidget):
                         pps = params.get('pps', None)
                         rate_percent = params.get('rate_percent', None)
                         rate_to_pass = None if pps else rate_percent
-                        if pps:
-                            pps = helper.format_pps(pps)
+                        #if pps:
+                        #   pps = self.helper.format_pps(pps)
                         # Pass run parameters; controller.start_traffic should honor pps/run_mode/ burst_count / run_duration
                         if hasattr(self.controller, 'start_traffic'):
                             success, message = self.controller.start_traffic(

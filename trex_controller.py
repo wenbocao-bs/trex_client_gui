@@ -77,31 +77,38 @@ class TrexController:
         except Exception as e:
             return False, f"重置失败: {str(e)}"
     # ---------- traffic ----------
-    def start_traffic(self, ports: List[int], streams: List, rate_percent: float, duration: int = 0) -> Tuple[bool, str]:
+    def start_traffic(self, ports: List[int], streams: List, rate_percent: float, pps: str = None, duration: int = 0) -> Tuple[bool, str]:
         if not self.is_connected or not self.client:
             return False, "未连接到T-Rex"
         try:
             if streams is not None:
                 for p in ports:
-                    self.client.add_streams(streams, ports=[p])
-            if duration and duration > 0:
-                self.client.start(ports=ports, mult=f"{rate_percent}%", duration=duration)
+                    stream_id = self.client.add_streams(streams, ports=[p])
             else:
-                self.client.start(ports=ports, mult=f"{rate_percent}%")
+                stream_id = None
+            if pps is not None:
+                mult=pps
+            else:
+                mult=f"{rate_percent}%"
+            print(mult)
+            if duration and duration > 0:
+                self.client.start(ports=ports, mult=mult, duration=duration)
+            else:
+                self.client.start(ports=ports, mult=mult)
             print(f"ports={ports} rate_percent={rate_percent}")
             self.traffic_active = True
-            return True, "流量已启动"
+            return True, "流量已启动", stream_id
         except Exception as e:
             traceback.print_exc()
             return False, f"启动失败: {e}"
 
-    def stop_traffic(self) -> Tuple[bool, str]:
+    def stop_traffic(self, ports) -> Tuple[bool, str]:
         if not self.is_connected or not self.client:
             return False, "未连接"
         try:
-            self.client.stop()
+            self.client.stop(ports=ports)
             try:
-                self.client.wait_on_traffic()
+                self.client.wait_on_traffic(ports=[ports])
             except Exception:
                 pass
             self.traffic_active = False
@@ -171,6 +178,15 @@ class TrexController:
         except Exception as e:
             return False, f"移除失败: {e}"
 
+    def update_flow_on_port(self, port: int, index: int, flow_conf : Dict[str, Any]) -> Tuple[bool, str]:
+        try:
+            remove_flow = self.flow_configs[port][index]
+            self.client.remove_streams(remove_flow['stream_id_list'], port)
+            self.flow_configs[port].pop(index)
+            self.add_flow_to_port(port, flow_conf)
+            return True, f"flow update success"
+        except Exception as e:
+            return False, f"更新失败: {e}"
     def clear_port_flows(self, port: int) -> Tuple[bool, str]:
         try:
             self.flow_configs[port] = []
