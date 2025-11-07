@@ -363,9 +363,13 @@ class TrafficTab(QWidget):
 
         # Action row: targets + packet length / rate / run-mode / run-duration controls
         action_row = QHBoxLayout()
-        action_row.addWidget(QLabel("目标端口 (逗号/范围):"))
+        action_row.addWidget(QLabel("发送<->接收口"))
         self.target_ports_le = QLineEdit("0")
         action_row.addWidget(self.target_ports_le)
+        rx_ports_group = QGroupBox("")
+        rx_layout = QVBoxLayout()
+        self.rx_ports_le = QLineEdit("1")  #
+        action_row.addWidget(self.rx_ports_le)
 
         # Packet length controls group
         pktlen_group = QGroupBox("包长度")
@@ -1094,6 +1098,7 @@ class TrafficTab(QWidget):
             params['dst_port'] = int(self.dst_port_sb.value())
 
             ports_text = self.target_ports_le.text().strip()
+            rx_ports_text = self.rx_ports_le .text().strip()
             if not ports_text:
                 return None, "请填写目标端口"
             ports = []
@@ -1116,6 +1121,7 @@ class TrafficTab(QWidget):
             if not ports:
                 return None, "未解析到有效目标端口"
             params['target_ports'] = sorted(list(set(ports)))
+            params['recv_ports'] = rx_ports_text
 
             # composition from editor
             params['composition'] = copy.deepcopy(self.composition)
@@ -1138,7 +1144,7 @@ class TrafficTab(QWidget):
             params['burst_count'] = int(self.burst_count_sb.value()) if params['run_mode'] == 'burst' else None
             run_d = int(self.run_duration_sb.value())
             params['run_duration'] = run_d if run_d > 0 else None
-
+            print(params)
             return params, None
         except Exception as e:
             traceback.print_exc()
