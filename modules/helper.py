@@ -217,6 +217,27 @@ class HelperFunctions:
                 return "::1"
             else:
                 return "127.0.0.1"
+    def split_128bit_to_64bits(self, value):
+        """
+        将 128 位整数拆分为高 64 位和低 64 位
+
+        Args:
+            value: 128 位整数
+
+        Returns:
+            (high_64bits, low_64bits): 高 64 位和低 64 位组成的元组
+        """
+        # 确保是 128 位整数
+        if value.bit_length() > 128:
+            raise ValueError("输入值超过 128 位")
+
+        # 低 64 位：使用位掩码
+        low_64bits = value & 0xFFFFFFFFFFFFFFFF
+
+        # 高 64 位：右移 64 位
+        high_64bits = (value >> 64) & 0xFFFFFFFFFFFFFFFF
+
+        return high_64bits, low_64bits
 
 
 class PacketParser:

@@ -3,6 +3,7 @@
 # fixed / inc / dec / random。并且基于 params['composition'] 生成 TREX VM（支持 IPv4/IPv6）
 # 并把 create_streams_from_composition 集成到下发逻辑（on_add_to_device）。
 import random
+import argparse
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
     QGroupBox, QSpinBox, QLineEdit, QTextEdit, QListWidget,
@@ -19,6 +20,7 @@ from modules.helper import HelperFunctions
 
 # Optional T-Rex STL imports
 try:
+    from trex_stl_lib.api import *
     from trex.stl.api import STLStream, STLPktBuilder, STLTXCont, STLFlowStats, STLVM, STLTXSingleBurst
     TREX_STL_AVAILABLE = True
 except Exception:
@@ -1307,7 +1309,7 @@ class TrafficTab(QWidget):
         burst_count = params.get('burst_count', None)
         run_duration = params.get('run_duration', None)
         flow_type = (params.get('flow_type') or '').upper()
-
+        have_ipv6 = False
         def pkt_field_for(fname, l4_proto='UDP', is_ipv6=False):
             f = fname.lower()
             if 'src_ip' == f or f.endswith('_src_ip') or f in ('srcip','src_ip'):
@@ -1315,8 +1317,10 @@ class TrafficTab(QWidget):
             if 'dst_ip' == f or f.endswith('_dst_ip') or f in ('dstip','dst_ip','dst_ip'):
                 return 'IP.dst'
             if 'src_ipv6' == f or f.endswith('_src_ipv6') or f in ('srcipv6','src_ipv6'):
+                have_ipv6 = True
                 return 'IPv6.src'
             if 'dst_ipv6' == f or f.endswith('_dst_ipv6') or f in ('dstipv6','dst_ipv6','dst_ipv6'):
+                have_ipv6 = True
                 return 'IPv6.dst'
             if 'src_port' == f or f == 'sport' or f.endswith('src_port'):
                 return f"{l4_proto}.sport"
@@ -1478,17 +1482,25 @@ class TrafficTab(QWidget):
 
         # guess l4 proto
         l4_guess = (params.get('flow_type') or '').upper()
+        outer_l3_type = None
+        outer_l4_type = None 
+        inner_l3_type = None
+        inner_l4_type = None
         if not l4_guess:
             for layer in comp:
                 if layer.get('preset_id','').lower() == 'tcp':
-                    l4_guess = 'TCP'; break
+                    l4_guess = 'TCP'
+                    l4_type=CTRexVmInsFixHwCs.L4_TYPE_TCP
+                    break
                 if layer.get('preset_id','').lower() == 'udp':
-                    l4_guess = 'UDP'; break
+                    l4_guess = 'UDP'
+                    l4_type=CTRexVmInsFixHwCs.L4_TYPE_UDP
+                    break
                 if layer.get('preset_id','').lower() == 'sctp':
-                    l4_guess = 'SCTP'; break
-        if not l4_guess:
-            l4_guess = 'UDP'
-
+                    l4_guess = 'SCTP';
+                    l4_type=CTRexVmInsFixHwCs.L4_TYPE_SCTP
+                    break
+        is_ipv6 = False
         # VM vars for composition fields (same as before)
         for li, layer in enumerate(comp):
             fields = layer.get('fields', {})
@@ -1499,7 +1511,6 @@ class TrafficTab(QWidget):
                 start = fcfg.get('start', fcfg.get('value',''))
                 end = fcfg.get('end', start)
                 step = int(fcfg.get('step', 1) or 1)
-                is_ipv6 = False
                 if isinstance(start, str):
                     if any(ip_keyword in fname.lower() for ip_keyword in ['ip', 'address']):
                         if ':' in start and start.count(':') >= 2:
@@ -1529,12 +1540,26 @@ class TrafficTab(QWidget):
                                 op = 'rand'
                             elif mode == 'dec':
                                 op = 'dec'
-                            size = 16 if is_ipv6 else 4
+                            size = 8 if is_ipv6 else 4
                             try:
-                                vm.var(name=var_name, min_value=s_int, max_value=e_int, size=size, op=op, step=step)
-                                vm.write(fv_name=var_name, pkt_offset=pkt_field)
+                                if is_ipv6:
+                                    hi_s_int, lo_s_int=self.helper.split_128bit_to_64bits(s_int)
+                                    hi_e_int, lo_e_int=self.helper.split_128bit_to_64bits(e_int)
+
+
+                                    print(pkt_field)
+                                    vm.var(name=f"{var_name}_hi", min_value=hi_s_int, max_value=hi_e_int, size=size, op=op, step=step)
+                                    vm.write(fv_name=f"{var_name}_hi", pkt_offset="IPv6.src")
+                                    vm.var(name=f"{var_name}_lo", min_value=lo_s_int, max_value=lo_e_int, size=size, op=op, step=step)
+                                    vm.write(fv_name=f"{var_name}_lo", pkt_offset=pkt_field, offset_fixup=8)
+                                else:
+                                    exit()
+                                    vm.var(name=var_name, min_value=s_int, max_value=e_int, size=size, op=op, step=step)
+                                    vm.write(fv_name=var_name, pkt_offset=pkt_field)
                             except Exception:
+                                traceback.print_exc()
                                 try:
+                                    exit(0)
                                     vm.var(var_name, s_int, e_int, size, op, step=step)
                                     vm.write(fv_name=var_name, pkt_offset=pkt_field)
                                 except Exception as e2:
@@ -1584,12 +1609,19 @@ class TrafficTab(QWidget):
                     vm_desc['writes'].append((var_name, pkt_field))
 
         # request checksum fix if trex available
-        if trex_ok:
+        if trex_ok and var_counter:
             try:
-                vm.fix_chksum()
+                if is_ipv6:
+                    l3_offset='IPv6'
+                else:
+                    l3_offset='IP'
+                print(f"have_ipv6 {have_ipv6} {l3_offset}, {l4_guess}")
+                vm.fix_chksum_hw(l3_offset=l3_offset, l4_offset = l4_guess, l4_type=l4_type)
+                #vm.fix_chksum()
             except Exception:
                 try:
-                    vm.fix_ipv4()
+                    if is_ipv6 != 1:
+                        vm.fix_ipv4()
                 except Exception:
                     pass
 
