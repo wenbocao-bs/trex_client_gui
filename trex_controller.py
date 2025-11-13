@@ -83,7 +83,11 @@ class TrexController:
         try:
             if streams is not None:
                 for p in ports:
-                    stream_id = self.client.add_streams(streams, ports=[p])
+                    try:
+                        self.client.remove_all_streams(ports=[p])
+                        stream_id = self.client.add_streams(streams, ports=[p])
+                    except Exception as e:
+                        print(f"{e}")
             else:
                 stream_id = None
             if pps is not None:
@@ -172,7 +176,7 @@ class TrexController:
         try:
             if port in self.flow_configs and 0 <= index < len(self.flow_configs[port]):
                 self.flow_configs[port].pop(index)
-                # optionally call client.remove_all_streams(ports=[port]) if desired
+                # optionally call client.remove_all_streams(ports=[port]) if desire
                 return True, "已移除"
             return False, "流不存在"
         except Exception as e:

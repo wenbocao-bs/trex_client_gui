@@ -50,14 +50,15 @@ LAYER_PRESETS = {
          'fields': {
              'dst_mac': {'mode':'fixed','value':'00:02:00:03:04:02','start':'00:02:00:03:04:02','end':'00:02:00:03:04:02','step':1},
              'src_mac': {'mode':'fixed','value':'00:03:00:01:40:01','start':'00:03:00:01:40:01','end':'00:03:00:01:40:01','step':1},
+             'l2_type': {'mode':'fixed', 'value':0x0800, 'start':0, 'end':65535, 'step':1},
          }
         },
-        {'id': 'dot3', 'name': 'Ethernet', 'template': "Dot3(dst='{dst_mac}', src='{src_mac}')",
-          'fields': {
-             'dst_mac': {'mode':'fixed','value':'ff:ff:ff:ff:ff:ff','start':'00:02:00:03:04:02','end':'00:02:00:03:04:02','step':1},
-             'src_mac': {'mode':'fixed','value':'00:03:00:01:40:01','start':'00:03:00:01:40:01','end':'00:03:00:01:40:01','step':1},
-         }
-        },
+        #{'id': 'dot3', 'name': 'Ethernet', 'template': "Dot3(dst='{dst_mac}', src='{src_mac}')",
+        #  'fields': {
+        #     'dst_mac': {'mode':'fixed','value':'ff:ff:ff:ff:ff:ff','start':'00:02:00:03:04:02','end':'00:02:00:03:04:02','step':1},
+        #     'src_mac': {'mode':'fixed','value':'00:03:00:01:40:01','start':'00:03:00:01:40:01','end':'00:03:00:01:40:01','step':1},
+        # }
+        #},
         {'id': 'dot1q', 'name': 'Dot1Q (802.1Q)', 'template': "Dot1Q(vlan={vlan_id}, prio={vlan_prio})",
          'fields': {'vlan_id': {'mode':'fixed','value':100,'start':1,'end':4094,'step':1}, 'vlan_prio': {'mode':'fixed','value':0,'start':0,'end':7,'step':1}}},
         {'id': 'dot1ad', 'name': 'Dot1AD (Q-in-Q)', 'template': "Dot1Q(vlan={outer_vlan})/Dot1Q(vlan={inner_vlan})",
@@ -108,14 +109,20 @@ LAYER_PRESETS = {
     ],
 
     'L3': [
-        {'id': 'ipv4', 'name': 'IPv4', 'template': "IP(src='{src_ip}', dst='{dst_ip}', ttl={ttl})",
+        {'id': 'ipv4', 'name': 'IPv4', 'template': "IP(src='{src_ip}', dst='{dst_ip}', ttl={ttl}, proto={l3_proto})",
          'fields': {'src_ip': {'mode':'fixed','value':'16.0.0.1','start':'16.0.0.1','end':'16.0.0.1','step':1},
                     'dst_ip': {'mode':'fixed','value':'48.0.0.1','start':'48.0.0.1','end':'48.0.0.1','step':1},
-                    'ttl': {'mode':'fixed','value':64,'start':1,'end':255,'step':1}}},
-        {'id': 'ipv6', 'name': 'IPv6', 'template': "IPv6(src='{src_ipv6}', dst='{dst_ipv6}', hlim={hlim})",
+                    'ttl': {'mode':'fixed','value':64,'start':1,'end':255,'step':1},
+                    'l3_proto': {'mode':'fixed', 'value':0, 'start':1, 'end':255, 'step':1},
+                    }
+         },
+        {'id': 'ipv6', 'name': 'IPv6', 'template': "IPv6(src='{src_ipv6}', dst='{dst_ipv6}', hlim={hlim}, nh={l3_proto})",
          'fields': {'src_ipv6': {'mode':'fixed','value':'fc00::1','start':'fc00::1','end':'fc00::1','step':1},
                     'dst_ipv6': {'mode':'fixed','value':'fd00::2','start':'fd00::2','end':'fd00::2','step':1},
-                    'hlim': {'mode':'fixed','value':64,'start':1,'end':255,'step':1}}},
+                    'hlim': {'mode':'fixed','value':64,'start':1,'end':255,'step':1},
+                    'l3_proto': {'mode':'fixed', 'value':0, 'start':1, 'end':255, 'step':1},
+                    }
+         },
 
         # Address resolution and ARP family
         {'id': 'arp', 'name': 'ARP', 'template': "ARP(psrc='{src_ip}', pdst='{dst_ip}', hwsrc='{src_mac}', hwdst='{dst_mac}', op={op})",
@@ -137,8 +144,6 @@ LAYER_PRESETS = {
         {'id': 'sctp', 'name': 'SCTP', 'template': "SCTP(sport={src_port}, dport={dst_port})",
          'fields': {'src_port': {'mode':'fixed','value':5000,'start':1,'end':65535,'step':1},
                     'dst_port': {'mode':'fixed','value':5001,'start':1,'end':65535,'step':1}}},
-        # Common transport placeholders
-        {'id': 'raw', 'name': 'RawPayload', 'template': "Raw(load={raw_bin})", 'fields': {'raw_bin': {'mode':'fixed','value':"b'\\x00'","start":"b'\\x00'","end":"b'\\x00'","step":1}}}
     ],
 
     'TUNNEL': [
@@ -739,59 +744,102 @@ class TrafficTab(QWidget):
         """开始打流"""
         idx = self._selected_flow_index
         port = self._selected_port_for_view
-        if port is None or idx is None:
-            QMessageBox.information(self, "未选择", "请先选择端口和flow")
+        if port is None:
+            QMessageBox.information(self, "未选择", "请先选择端口")
             return
 
         try:
-            flows = self.controller.flow_configs.get(port, [])
-            if idx < 0 or idx >= len(flows):
-                QMessageBox.warning(self, "错误", "选中的flow索引无效")
-                return
-
-            flow = flows[idx]
-            flow_name = flow.get('name', f"flow_{idx}")
-
             if not getattr(self.controller, 'is_connected', False):
                 QMessageBox.warning(self, "连接错误", "T-Rex未连接，请先连接T-Rex设备")
                 return
-
-            params = flow.get('params', {})
-            # Ensure safe retrieval
-            pps = params.get('pps', None)
-            rate_percent = params.get('rate_percent', None)
-            run_mode = params.get('run_mode', 'continuous')
-            burst_count = params.get('burst_count', None)
-            run_duration = params.get('run_duration', None)
-
-            # If pps is set, do NOT pass percentage to controller (pps takes precedence)
-            if pps:
-                pps = self.helper.format_pps(pps)
-                rate_to_pass = None
-            else:
-                rate_to_pass = rate_percent
-
-            # create streams (they contain enough meta for controller if needed)
-            streams, err = self.create_streams_from_composition(params)
-            if err and not streams:
-                QMessageBox.warning(self, "流生成失败", f"无法生成流数据: {err}")
+            flows = self.controller.flow_configs.get(port, [])
+            if idx != None and idx >= len(flows):
+                QMessageBox.warning(self, "错误", "选中的flow索引无效")
                 return
+            streams=[]
+            errors=[]
+            total_pps=None
+            total_rate_to_pass = None
+            if idx == None and len(flows) > 0:
+                for i, flow in enumerate(flows):
+                    flow_name = flow.get('name', f"flow_{i}")
+                    print(f"处理流 {i}: {flow_name}")
+                    if not getattr(self.controller, 'is_connected', False):
+                        QMessageBox.warning(self, "连接错误", "T-Rex未连接，请先连接T-Rex设备")
+                        return
 
+                    params = flow.get('params', {})
+                    # Ensure safe retrieval
+                    pps = params.get('pps', None)
+                    rate_percent = params.get('rate_percent', None)
+                    run_mode = params.get('run_mode', 'continuous')
+                    burst_count = params.get('burst_count', None)
+                    run_duration = params.get('run_duration', None)
+
+                    # If pps is set, do NOT pass percentage to controller (pps takes precedence)
+                    if pps:
+                        pps = self.helper.format_pps(pps)
+                        rate_to_pass = None
+                    else:
+                        rate_to_pass = rate_percent
+                    total_pps += pps
+                    total_rate_to_pass += rate_to_pass
+                    print(params)
+                    # create streams (they contain enough meta for controller if needed)
+                    stream, err = self.create_streams_from_composition(params)
+                    if err and not streams:
+                        QMessageBox.warning(self, "流生成失败", f"无法生成流数据: {err}")
+                        return
+                    streams.extend(stream)
+            else:
+                flow = flows[idx]
+                flow_name = flow.get('name', f"flow_{idx}")
+                params = flow.get('params', {})
+                # Ensure safe retrieval
+                pps = params.get('pps', None)
+                rate_percent = params.get('rate_percent', None)
+                run_mode = params.get('run_mode', 'continuous')
+                burst_count = params.get('burst_count', None)
+                run_duration = params.get('run_duration', None)
+                # create streams (they contain enough meta for controller if needed)
+                streams, err = self.create_streams_from_composition(params)
+                if err and not streams:
+                    QMessageBox.warning(self, "流生成失败", f"无法生成流数据: {err}")
+                    return
+             # If pps is set, do NOT pass percentage to controller (pps takes precedence)
+                if pps:
+                    pps = self.helper.format_pps(pps)
+                    rate_to_pass = None
+                else:
+                    rate_to_pass = rate_percent
+                total_pps = pps
+                total_rate_to_pass = rate_to_pass
             try:
                 if hasattr(self.controller, 'start_traffic'):
                     success, message, stream_id_list = self.controller.start_traffic(
                         streams=streams,
                         ports=[port],
-                        rate_percent=rate_to_pass,
-                        pps=pps,
+                        rate_percent=total_rate_to_pass,
+                        pps=total_pps,
                         duration=run_duration
                     )
                     if success:
-                        flow['active'] = True
-                        flow['paused'] = False
-                        flow['stream_id_list'] = stream_id_list
-                        self.append_status(f"开始打流成功: {flow_name} (端口 {port})", "成功")
-                        self._update_flow_status_display(port, idx, True)
+                        if idx == None:
+                            for i, flow in enumerate(flows):
+                                flow = flows[i]
+                                flow_name = flow.get('name', f"flow_{idx}")
+                                flow['active'] = True
+                                flow['paused'] = False
+                                flow['stream_id_list'] = stream_id_list
+                                self.append_status(f"开始打流成功: {flow_name} (端口 {port})", "成功")
+                                self._update_flow_status_display(port, i, True)
+                        else:
+                            flow['active'] = True
+                            flow['paused'] = False
+                            flow['stream_id_list'] = stream_id_list
+                            flow_name = flow.get('name', f"flow_{idx}")
+                            self.append_status(f"开始打流成功: {flow_name} (端口 {port})", "成功")
+                            self._update_flow_status_display(port, idx, True)
                     else:
                         QMessageBox.warning(self, "打流失败", f"开始打流失败: {message}")
                         self.append_status(f"开始打流失败: {message}", "错误")
@@ -1322,14 +1370,16 @@ class TrafficTab(QWidget):
             if 'dst_ipv6' == f or f.endswith('_dst_ipv6') or f in ('dstipv6','dst_ipv6','dst_ipv6'):
                 have_ipv6 = True
                 return 'IPv6.dst'
+            if 'l3_proto' == f or f.endswith('l3proto'):
+                return 'IPv6.nh' if is_ipv6 else 'IP.proto'
             if 'src_port' == f or f == 'sport' or f.endswith('src_port'):
                 return f"{l4_proto}.sport"
             if 'dst_port' == f or f == 'dport' or f.endswith('dst_port'):
                 return f"{l4_proto}.dport"
             if 'src_mac' == f or f == 'smac':
-                return 'ETH.src'
+                return 'Ether.src'
             if 'dst_mac' == f or f == 'dmac':
-                return 'ETH.dst'
+                return 'Ether.dst'
             if 'vlan' in f or 'vlan_id' == f:
                 return 'Dot1Q.vlan'
             if 'ip' in f:
@@ -1527,6 +1577,11 @@ class TrafficTab(QWidget):
                     continue
                 var_name = f"vm_{li}_{var_counter}_{fname}"
                 var_counter += 1
+                op = 'inc'
+                if mode == 'random':
+                    op = 'random'
+                if mode == 'dec':
+                    op = 'dec'
                 # similar handling as prior implementation
                 if is_ipv6 or 'ip' in fname.lower():
                     try:
@@ -1535,19 +1590,11 @@ class TrafficTab(QWidget):
                         if s_int > e_int:
                             s_int, e_int = e_int, s_int
                         if trex_ok:
-                            op = 'inc'
-                            if mode == 'random':
-                                op = 'rand'
-                            elif mode == 'dec':
-                                op = 'dec'
                             size = 8 if is_ipv6 else 4
                             try:
                                 if is_ipv6:
                                     hi_s_int, lo_s_int=self.helper.split_128bit_to_64bits(s_int)
                                     hi_e_int, lo_e_int=self.helper.split_128bit_to_64bits(e_int)
-
-
-                                    print(pkt_field)
                                     vm.var(name=f"{var_name}_hi", min_value=hi_s_int, max_value=hi_e_int, size=size, op=op, step=step)
                                     vm.write(fv_name=f"{var_name}_hi", pkt_offset="IPv6.src")
                                     vm.var(name=f"{var_name}_lo", min_value=lo_s_int, max_value=lo_e_int, size=size, op=op, step=step)
@@ -1577,11 +1624,6 @@ class TrafficTab(QWidget):
                     except Exception:
                         s_n = e_n = None
                     if trex_ok and s_n is not None and e_n is not None:
-                        op = 'inc'
-                        if mode == 'random':
-                            op = 'rand'
-                        if mode == 'dec':
-                            op = 'dec'
                         try:
                             vm.var(name=var_name, min_value=s_n, max_value=e_n, size=2, op=op)
                             vm.write(fv_name=var_name, pkt_offset=pkt_field)
@@ -1591,13 +1633,24 @@ class TrafficTab(QWidget):
                     else:
                         vm_desc['vars'].append(('port', var_name, start, end, mode, step))
                         vm_desc['writes'].append((var_name, pkt_field))
+                elif 'l3_proto' in fname.lower():
+                    try:
+                        vm.var(name=var_name, min_value=s_n, max_value=e_n, size=1, op=op)
+                        vm.write(fv_name=var_name, pkt_offset=pkt_field)
+                    except Exception:
+                        traceback.print_exc()
                 elif 'mac' in fname.lower():
                     val = fcfg.get('value','')
                     if trex_ok and val:
                         try:
-                            mac_int = int(val.replace(':','').replace('-',''), 16)
-                            vm.var(name=var_name, min_value=mac_int, max_value=mac_int, size=6, op='inc')
-                            vm.write(fv_name=var_name, pkt_offset=pkt_field)
+                            mac_int_min = self.helper.from_mac_string(start)
+                            mac_int_max = self.helper.from_mac_string(end)
+                            hi_s_int, lo_s_int=self.helper.split_mac_int(mac_int_min)
+                            hi_e_int, lo_e_int=self.helper.split_mac_int(mac_int_max)
+                            vm.var(name=f"{var_name}_hi", min_value=hi_s_int, max_value=hi_e_int, size=4, op=op, step=step)
+                            vm.write(fv_name=f"{var_name}_hi", pkt_offset=pkt_field)
+                            vm.var(name=f"{var_name}_lo", min_value=lo_s_int, max_value=lo_e_int, size=2, op=op, step=step)
+                            vm.write(fv_name=f"{var_name}_lo", pkt_offset=pkt_field, offset_fixup=4)
                         except Exception:
                             vm_desc['vars'].append(('mac', var_name, val, val, 'fixed', 1))
                             vm_desc['writes'].append((var_name, pkt_field))

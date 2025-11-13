@@ -14,6 +14,9 @@ from PyQt5.QtCore import Qt
 class HelperFunctions:
     """工具函数类"""
 
+    def __init__(self, byteorder='big'):
+        self.byteorder = byteorder
+
     @staticmethod
     def format_bps(bps: float) -> str:
         """格式化比特率显示"""
@@ -239,6 +242,41 @@ class HelperFunctions:
 
         return high_64bits, low_64bits
 
+    def split_mac_int(self, mac_int):
+        """拆分MAC地址整数"""
+        if self.byteorder == 'big':
+            return (mac_int >> 16) & 0xFFFFFFFF, mac_int & 0xFFFF
+        else:
+            # 小端序处理
+            mac_bytes = mac_int.to_bytes(6, byteorder='little')
+            high_bytes = mac_bytes[2:]
+            low_bytes = mac_bytes[:2]
+            return (
+                int.from_bytes(high_bytes, byteorder='little'),
+                int.from_bytes(low_bytes, byteorder='little')
+            )
+
+    def join(self, high_4bytes, low_2bytes):
+        """将拆分部分合并为完整MAC地址整数"""
+        if self.byteorder == 'big':
+            return (high_4bytes << 16) | low_2bytes
+        else:
+            # 小端序处理
+            high_bytes = high_4bytes.to_bytes(4, byteorder='little')
+            low_bytes = low_2bytes.to_bytes(2, byteorder='little')
+            full_bytes = low_bytes + high_bytes
+            return int.from_bytes(full_bytes, byteorder='little')
+
+    def to_mac_string(self, mac_int):
+        """转换为MAC地址字符串格式"""
+        mac_bytes = mac_int.to_bytes(6, byteorder=self.byteorder)
+        return ':'.join(f'{b:02X}' for b in mac_bytes)
+
+    def from_mac_string(self, mac_str):
+        """从MAC地址字符串转换为整数"""
+        bytes_list = [int(byte, 16) for byte in mac_str.split(':')]
+        mac_bytes = bytes(bytes_list)
+        return int.from_bytes(mac_bytes, byteorder=self.byteorder)
 
 class PacketParser:
     """数据包解析工具类"""
@@ -342,11 +380,11 @@ class StatisticsCalculator:
         return jitter_sum / (len(latency_values) - 1)
 
 # 创建全局实例
-helper = HelperFunctions()
-packet_parser = PacketParser()
-stats_calculator = StatisticsCalculator()
-
-# 向后兼容的别名
-format_bps = helper.format_bps
-format_pps = helper.format_pps
-format_bytes = helper.format_bytes
+#helper = HelperFunctions()
+#packet_parser = PacketParser()
+#stats_calculator = StatisticsCalculator()
+#
+## 向后兼容的别名
+#format_bps = helper.format_bps
+#format_pps = helper.format_pps
+#format_bytes = helper.format_bytes
